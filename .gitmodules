@@ -1,0 +1,21 @@
+[submodule "src/third_party/quicknes"]
+	path = src/third_party/quicknes
+	url = https://github.com/itsveenee/QuickNES_Core.git
+	branch = master
+[submodule "src/third_party/picodrive"]
+	path = src/third_party/picodrive
+	url = https://github.com/itsveenee/picodrive.git
+[submodule "src/third_party/beetle-pce-fast"]
+	path = src/third_party/beetle-pce-fast
+	url = https://github.com/itsveenee/beetle-pce-fast-libretro.git
+	branch = master
+[submodule "src/third_party/snes9x2010"]
+	path = src/third_party/snes9x2010
+	url = https://github.com/itsveenee/snes9x2010.git
+	branch = master
+
+[submodule "src/third_party/fceumm-fds"]
+	path = src/third_party/fceumm-fds
+	url = https://github.com/itsveenee/Fceumm-PS2.git
+	branch = master
+

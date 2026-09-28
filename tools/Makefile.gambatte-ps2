@@ -1,0 +1,152 @@
+# AURORA_GAMBATTE_V1
+# PS2 static build for libretro/gambatte (Game Boy / Game Boy Color).
+#
+# Upstream has no PS2 platform target, so this Makefile compiles the
+# exact source set from upstream Makefile.common with the PS2 EE
+# toolchain. Objects and the raw archive live under Aurora/build/gambatte,
+# never inside the pinned checkout.
+#
+# Output: build/gambatte/gambatte_libretro_ps2_raw.a (pre-namespace).
+
+CC ?= mips64r5900el-ps2-elf-gcc
+CXX ?= mips64r5900el-ps2-elf-g++
+AR ?= mips64r5900el-ps2-elf-ar
+
+ifeq ($(strip $(PS2SDK)),)
+ifneq ($(strip $(PS2DEV)),)
+PS2SDK := $(PS2DEV)/ps2sdk
+endif
+endif
+
+GAMBATTE_DIR := $(GAMBATTE_DIR)
+
+AURORA_GAMBATTE_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
+AURORA_ROOT := $(abspath $(dir $(AURORA_GAMBATTE_MAKEFILE))/..)
+BUILD_DIR := $(AURORA_ROOT)/build/gambatte
+OBJ_DIR := $(BUILD_DIR)/obj
+TARGET := $(BUILD_DIR)/gambatte_libretro_ps2_raw.a
+
+CORE_DIR := $(GAMBATTE_DIR)/libgambatte/src
+LIBRETRO_DIR := $(GAMBATTE_DIR)/libgambatte/libretro
+LIBRETRO_COMM_DIR := $(GAMBATTE_DIR)/libgambatte/libretro-common
+
+INCFLAGS := \
+	-I$(CORE_DIR) \
+	-I$(GAMBATTE_DIR)/libgambatte/include \
+	-I$(GAMBATTE_DIR)/common \
+	-I$(GAMBATTE_DIR)/common/resample \
+	-I$(LIBRETRO_DIR) \
+	-I$(LIBRETRO_COMM_DIR)/include
+
+SOURCES_C := \
+	$(LIBRETRO_DIR)/gambatte_log.c \
+	$(LIBRETRO_DIR)/blipper.c \
+	$(LIBRETRO_DIR)/cc_resampler.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_posix_string.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_snprintf.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
+	$(LIBRETRO_COMM_DIR)/compat/compat_strl.c \
+	$(LIBRETRO_COMM_DIR)/compat/fopen_utf8.c \
+	$(LIBRETRO_COMM_DIR)/encodings/encoding_utf.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path.c \
+	$(LIBRETRO_COMM_DIR)/file/file_path_io.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream_transforms.c \
+	$(LIBRETRO_COMM_DIR)/string/stdstring.c \
+	$(LIBRETRO_COMM_DIR)/time/rtime.c \
+	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c
+
+SOURCES_CXX := \
+	$(CORE_DIR)/bootloader.cpp \
+	$(CORE_DIR)/cpu.cpp \
+	$(CORE_DIR)/gambatte.cpp \
+	$(CORE_DIR)/initstate.cpp \
+	$(CORE_DIR)/interrupter.cpp \
+	$(CORE_DIR)/interruptrequester.cpp \
+	$(CORE_DIR)/gambatte-memory.cpp \
+	$(CORE_DIR)/sound.cpp \
+	$(CORE_DIR)/statesaver.cpp \
+	$(CORE_DIR)/tima.cpp \
+	$(CORE_DIR)/video.cpp \
+	$(CORE_DIR)/video_libretro.cpp \
+	$(CORE_DIR)/mem/cartridge.cpp \
+	$(CORE_DIR)/mem/cartridge_libretro.cpp \
+	$(CORE_DIR)/mem/huc3.cpp \
+	$(CORE_DIR)/mem/memptrs.cpp \
+	$(CORE_DIR)/mem/rtc.cpp \
+	$(CORE_DIR)/sound/channel1.cpp \
+	$(CORE_DIR)/sound/channel2.cpp \
+	$(CORE_DIR)/sound/channel3.cpp \
+	$(CORE_DIR)/sound/channel4.cpp \
+	$(CORE_DIR)/sound/duty_unit.cpp \
+	$(CORE_DIR)/sound/envelope_unit.cpp \
+	$(CORE_DIR)/sound/length_counter.cpp \
+	$(CORE_DIR)/video/ly_counter.cpp \
+	$(CORE_DIR)/video/lyc_irq.cpp \
+	$(CORE_DIR)/video/next_m0_time.cpp \
+	$(CORE_DIR)/video/ppu.cpp \
+	$(CORE_DIR)/video/sprite_mapper.cpp \
+	$(LIBRETRO_DIR)/libretro.cpp
+
+OBJECTS := \
+	$(patsubst $(GAMBATTE_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES_C)) \
+	$(patsubst $(GAMBATTE_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SOURCES_CXX))
+DEPS := $(OBJECTS:.o=.d)
+
+CFLAGS := \
+	$(INCFLAGS) \
+	-mno-check-zero-division \
+	-D_EE -DPS2 \
+	-I$(PS2SDK)/ee/include \
+	-I$(PS2SDK)/common/include \
+	-DVIDEO_RGB565=1 \
+	-DHAVE_STDINT_H -DHAVE_INTTYPES_H -DHAVE_STRINGS_H \
+	-D__LIBRETRO__ \
+	-O3 -DNDEBUG \
+	-fomit-frame-pointer \
+	-Wall -Wno-sign-compare -Wno-unused-variable -Wno-unused-function \
+	-Wno-uninitialized -Wno-strict-aliasing \
+	-ffunction-sections -fdata-sections
+
+CXXFLAGS := \
+	$(CFLAGS) \
+	-fno-rtti -fno-exceptions \
+	-std=c++11 \
+	-Wno-register
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(OBJECTS)
+
+$(OBJ_DIR)/%.o: $(GAMBATTE_DIR)/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ_DIR)/%.o: $(GAMBATTE_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+# AURORA_GB_STATESAVER_O2_V34_20260913: statesaver.cpp's fn-pointer
+# dispatch (`(*it->load)(file, state)` / `(*it->save)(file, state)`)
+# is layout-sensitive on PS2 real hardware. Under -O3 the compiler
+# inlines/arranges the dispatch site so the indirect branch lands on a
+# TLB fault boundary; under -O2 the same dispatch works. This is a
+# per-file override -- every other source keeps -O3.
+$(OBJ_DIR)/libgambatte/src/statesaver.o: $(GAMBATTE_DIR)/libgambatte/src/statesaver.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(INCFLAGS) -mno-check-zero-division -D_EE -DPS2 \
+		-I/root/.local/ps2dev/ps2sdk/ee/include -I/root/.local/ps2dev/ps2sdk/common/include \
+		-DVIDEO_RGB565=1 -DHAVE_STDINT_H -DHAVE_INTTYPES_H -DHAVE_STRINGS_H -D__LIBRETRO__ \
+		-O2 -DNDEBUG -fomit-frame-pointer -Wall -Wno-sign-compare -Wno-unused-variable \
+		-Wno-unused-function -Wno-uninitialized -Wno-strict-aliasing \
+		-ffunction-sections -fdata-sections -fno-rtti -fno-exceptions -std=c++11 \
+		-Wno-register -MMD -MP -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+-include $(DEPS)
+
+.PHONY: all clean

@@ -1,0 +1,1090 @@
+#include <ctype.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <kernel.h>
+#include <loadfile.h>
+#include <sifrpc.h>
+#define NEWLIB_PORT_AWARE          /* libera fileXio no port newlib (igual main.cpp) */
+#include <io_common.h>             /* FIO_MT_RDWR (guard proprio newlib) */
+#include <fileXio.h>
+#include <fileXio_rpc.h>
+#undef NEWLIB_PORT_AWARE
+
+extern "C" {
+#include <netman.h>
+}
+
+#include "embedded_irx.h"
+
+/* These headers are generated at build time by bin2c from the
+   corresponding files in irx/ or directly from $(PS2SDK)/iop/irx/.
+   Each one defines:
+       unsigned char  <name>_irx[]            __attribute__((aligned(16)));
+       unsigned int   size_<name>_irx;
+   They are included exactly once in this translation unit so the arrays
+   end up as ordinary globals in the ELF. */
+#include "audsrv_irx.h"
+#include "freesd_irx.h"
+#include "sio2man_irx.h"
+#include "mcman_irx.h"
+#include "mcserv_irx.h"
+#include "padman_irx.h"
+#include "mtapman_irx.h"
+#include "ps2dev9_irx.h"
+#include "netman_irx.h"
+#include "smap_irx.h"
+#include "ps2ip_irx.h"
+#include "ps2ips_irx.h"
+#include "smbman_irx.h"
+#include "cdfs_stream_irx.h"
+
+/* Stack BDM moderna fixada (FreeUsbd mini + FAT/exFAT/GPT). */
+#include "usbd_irx.h"
+#include "ps2mouse_irx.h"
+#include "bdm_irx.h"
+#include "bdmfs_fatfs_irx.h"
+#include "usbmass_bd_irx.h"
+#include "ps2atad_irx.h"
+#include "ps2hdd_irx.h"
+#include "atad_bd_irx.h"
+#ifdef HAVE_PS2FS
+#include "ps2fs_irx.h"
+#endif
+#include "mmceman_irx.h"
+#include "mx4sio_bd_irx.h"
+
+/* Log visivel no splash de boot (real hardware) -- definido em audio_audsrv.c. */
+extern "C" void ScrPrintf(const char *pFormat, ...);
+extern "C" void BootImport(const char *pName, int ret);
+
+struct EmbeddedEntry
+{
+    const char          *name;
+    const unsigned char *data;
+    unsigned int         size;
+};
+
+/* All four iaddis-era custom IRX modules (CDVD.IRX, SJPCM2.IRX,
+   MCSAVE.IRX, NETPLAY.IRX) have been retired.  On NetherSX2 -- and on
+   any other IOP that isn't a 100% faithful real PS2 -- they would
+   load via SifExecModuleBuffer but their RPC entry points never came
+   up or came up incompatibly with the rom-resident services already
+   bound by main.cpp / the BIOS, and the matching EE-side init function
+   (CDVD_Init, Aud_Init, MCSave_Init) would spin forever in
+   SifBindRpc and deadlock the boot.  Each one has been replaced with
+   a modern PS2SDK-based path:
+
+     - audio   : PS2DEV audsrv.irx, embedded here from
+                 $(PS2SDK)/iop/irx/audsrv.irx, plus a freesd.irx
+                 fallback (used when the BIOS does not ship
+                 rom0:LIBSD).  See src/modules/sjpcm/sjpcm_rpc.c for
+                 the EE-side wrapper.
+     - cdfs    : CdfsLoadEmbeddedIrx() loads the in-tree streaming
+                 cdfs.irx, which removes the stock driver's fixed
+                 256-entry directory table. The browser and ROM loader
+                 reach the disc through fileXio/newlib stdio.
+     - memcard : sio2man.irx + mcman.irx + mcserv.irx, embedded here
+                 and loaded by MemCardLoadEmbeddedIrx().  All save
+                 paths go through newlib stdio onto mcman/mcserv via
+                 iomanX -- the synchronous fallback that
+                 mainloop_state.cpp::MCSave_Write already had.  The
+                 async MCSave_Init() RPC path is gone.
+     - netplay : the protocol runs on the EE itself, mirrored from
+                 hugorsgarcia/PS2SNESticle/SNESticle/Modules/netplay/
+                 Source under src/modules/netplay/protocol/, talking
+                 straight to lwIP through PS2SDK's <sys/socket.h>
+                 shims.  The lwIP-side stack (ps2dev9 + netman + smap
+                 + ps2ip) is embedded here and loaded by
+                 NetIfLoadEmbeddedIrx().
+
+   Net effect: no IRX file has to be shipped next to the ELF for any
+   subsystem to work; the ELF is fully self-contained. */
+static const EmbeddedEntry s_embedded[] =
+{
+    { "AUDSRV.IRX",  audsrv_irx,  sizeof(audsrv_irx)  },
+    /* freesd is the PS2SDK-supplied SPU2 driver IRX, used as a
+       universal fallback when rom0:LIBSD is absent (early Japanese
+       models, some emulator setups). audsrv binds to its sceSd*
+       exports the same way it would to LIBSD's. */
+    { "FREESD.IRX",  freesd_irx,  sizeof(freesd_irx)  },
+};
+
+static const char *path_basename(const char *path)
+{
+    const char *p = path;
+    const char *base = path;
+
+    while (*p)
+    {
+        if (*p == '/' || *p == '\\' || *p == ':')
+        {
+            base = p + 1;
+        }
+        p++;
+    }
+
+    return base;
+}
+
+static int eq_ci(const char *a, const char *b)
+{
+    while (*a && *b)
+    {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return 0;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+extern "C" int EmbeddedIrxFind(const char *path,
+                               const unsigned char **out_data,
+                               unsigned int         *out_size)
+{
+    if (!path) return -1;
+
+    const char *base = path_basename(path);
+    if (!*base) return -1;
+
+    for (size_t i = 0; i < sizeof(s_embedded) / sizeof(s_embedded[0]); ++i)
+    {
+        if (eq_ci(base, s_embedded[i].name))
+        {
+            if (out_data) *out_data = s_embedded[i].data;
+            if (out_size) *out_size = s_embedded[i].size;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+extern "C" int EmbeddedIrxLoad(const unsigned char *data,
+                               unsigned int         size,
+                               int                  arg_len,
+                               const char          *args)
+{
+    int start_result = 1; /* MODULE_NO_RESIDENT_END until proven otherwise. */
+    int module_id;
+
+    /* SifExecModuleBuffer transfers the IRX from EE RAM to IOP RAM and
+       starts it.  Its return value only says that LOADFILE executed the
+       module; _start() can still reject the hardware/dependencies and return
+       MODULE_NO_RESIDENT_END (1).  The old loader discarded that second
+       result, which made MMCE/MX4SIO appear "loaded" with no live device. */
+    module_id = SifExecModuleBuffer(
+        (void *)data,
+        size,
+        arg_len,
+        args,
+        &start_result
+    );
+    if (module_id < 0)
+    {
+        return module_id;
+    }
+
+    /* Standard IRX results are 0=resident, 1=not resident and 2=resident
+       but removable.  Keep compatibility with modules that use another
+       positive resident value; only 1 and negative errors mean failure. */
+    if (start_result < 0)
+    {
+        printf(
+            "EmbeddedIrxLoad: module %d _start failed (%d)\n",
+            module_id,
+            start_result
+        );
+        return start_result;
+    }
+    if (start_result == 1)
+    {
+        printf(
+            "EmbeddedIrxLoad: module %d did not stay resident\n",
+            module_id
+        );
+        return EMBEDDED_IRX_ERROR_NOT_RESIDENT;
+    }
+
+    return module_id;
+}
+
+/* The upstream PS2SDK cdfs.irx stores a whole directory in a fixed
+   TocEntry[256] array during dopen. This embedded fork streams ISO9660/Joliet
+   records through a small sector window instead, so large ROM folders are
+   complete and consume less IOP RAM. */
+static int s_cdfs_loaded_result = 1; /* 1 = not yet attempted */
+
+extern "C" int CdfsLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_cdfs_loaded_result != 1)
+        return s_cdfs_loaded_result;
+
+    ret = EmbeddedIrxLoad(cdfs_stream_irx, sizeof(cdfs_stream_irx), 0, NULL);
+    BootImport("cdfs_stream", ret);
+    if (ret < 0)
+    {
+        printf("CdfsLoadEmbeddedIrx: cdfs_stream.irx failed (%d)\n", ret);
+        s_cdfs_loaded_result = ret;
+        return s_cdfs_loaded_result;
+    }
+
+    s_cdfs_loaded_result = 0;
+    return s_cdfs_loaded_result;
+}
+
+/* Memory-card stack bring-up.
+ *
+ * Order matches ps2_drivers::init_memcard_driver(true) and every other
+ * PS2 homebrew that brings the memcard up from scratch (picodrive,
+ * uLaunchELF, OPL, hugorsgarcia/PS2SNESticle):
+ *
+ *   1. sio2man.irx  - SIO2 transport layer used by the memcard and pad
+ *                     subsystems.  Must be loaded first; mcman / mcserv
+ *                     and (later) padman / mtapman all depend on it.
+ *   2. mcman.irx    - memcard manager; exposes the iomanX `mc0:`/`mc1:`
+ *                     device used by newlib fopen / mkdir / opendir.
+ *   3. mcserv.irx   - libmc RPC server (0x80000400).  Only required if
+ *                     anything calls mcInit / mcOpen / mcSync, but we
+ *                     load it anyway for parity with the previous
+ *                     init_memcard_driver(true) behaviour so libmc-
+ *                     based code paths keep working.
+ *
+ * We deliberately do NOT pre-check whether sio2man is already resident
+ * (e.g. from a re-init) -- SifExecModuleBuffer on an already-running
+ * module returns a duplicate-load error code (< 0) which we map to
+ * MEMCARD_INIT_STATUS_*.  Callers that need re-entrancy must gate on
+ * the static `s_loaded` flag below.
+ */
+static int s_memcard_loaded = 0;
+
+extern "C" int MemCardLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_memcard_loaded) return 0;
+
+    ret = EmbeddedIrxLoad(sio2man_irx, sizeof(sio2man_irx), 0, NULL);
+    BootImport("sio2man", ret);
+    if (ret < 0)
+    {
+        printf("MemCardLoadEmbeddedIrx: sio2man.irx failed (%d)\n", ret);
+        /* MEMCARD_INIT_STATUS_DEPENDENCY_IRX_ERROR */
+        return -4;
+    }
+
+    ret = EmbeddedIrxLoad(mcman_irx, sizeof(mcman_irx), 0, NULL);
+    BootImport("mcman", ret);
+    if (ret < 0)
+    {
+        printf("MemCardLoadEmbeddedIrx: mcman.irx failed (%d)\n", ret);
+        /* MEMCARD_INIT_STATUS_MCMAN_IRX_ERROR */
+        return -2;
+    }
+
+    ret = EmbeddedIrxLoad(mcserv_irx, sizeof(mcserv_irx), 0, NULL);
+    BootImport("mcserv", ret);
+    if (ret < 0)
+    {
+        printf("MemCardLoadEmbeddedIrx: mcserv.irx failed (%d)\n", ret);
+        /* MEMCARD_INIT_STATUS_MCSERV_IRX_ERROR */
+        return -3;
+    }
+
+    s_memcard_loaded = 1;
+    return 0;
+}
+
+/* USB + BDM stack bring-up (substitui o init_usb_driver() do ps2_drivers).
+ *
+ * Carrega a stack BDM fixada em irx/: le FAT16/FAT32/exFAT e tabelas MBR/GPT,
+ * enumerando cada pendrive/HD externo como massN:.  O usbd.irx completo do
+ * PS2SDK moderno teve regressoes em hardware; o buffer usbd_irx abaixo vem do
+ * FreeUsbd/usbd_mini usado pelo OPL.  Ordem canonica do OPL:
+ *
+ *   bdm.irx -> bdmfs_fatfs.irx -> usbd_mini.irx -> usbmass_bd.irx
+ *
+ * NAO usa dev9 (so' USB), entao nao tem o risco de travar boot do HD
+ * interno.  Cada passo loga via ScrPrintf, visivel no splash de boot --
+ * se der b.o., a ultima linha na tela mostra qual modulo falhou. */
+static int s_usb_bdm_loaded_result = 1; /* 1 = not yet attempted */
+/* AURORA_USB_SNES_MOUSE_V1_5
+ * Mouse is optional: failure must never take mass:/ down with it. */
+static int s_usb_mouse_loaded_result = 1; /* 1=not tried, 0=ready, <0=failed */
+static int s_dev9_loaded_result = 1;    /* shared by HDD and network */
+
+extern "C" int UsbMouseDriverAvailable(void)
+{
+    return s_usb_mouse_loaded_result == 0;
+}
+
+static int Dev9LoadEmbeddedIrxOnce(void)
+{
+    int ret;
+
+    if (s_dev9_loaded_result != 1)
+        return s_dev9_loaded_result;
+
+    ret = EmbeddedIrxLoad(ps2dev9_irx, sizeof(ps2dev9_irx), 0, NULL);
+    if (ret < 0)
+    {
+        s_dev9_loaded_result = ret;
+        return s_dev9_loaded_result;
+    }
+
+    s_dev9_loaded_result = 0;
+    return s_dev9_loaded_result;
+}
+
+extern "C" int UsbBdmLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_usb_bdm_loaded_result != 1)
+        return s_usb_bdm_loaded_result;
+
+    ret = EmbeddedIrxLoad(bdm_irx, sizeof(bdm_irx), 0, NULL);
+    BootImport("bdm", ret);
+    if (ret < 0)
+    {
+        printf("UsbBdm: bdm.irx failed (%d)\n", ret);
+        s_usb_bdm_loaded_result = -1;
+        return s_usb_bdm_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(bdmfs_fatfs_irx, sizeof(bdmfs_fatfs_irx), 0, NULL);
+    BootImport("bdmfs_fatfs", ret);
+    if (ret < 0)
+    {
+        printf("UsbBdm: bdmfs_fatfs.irx failed (%d)\n", ret);
+        s_usb_bdm_loaded_result = -2;
+        return s_usb_bdm_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(usbd_irx, sizeof(usbd_irx), 0, NULL);
+    BootImport("usbd_mini", ret);
+    if (ret < 0)
+    {
+        printf("UsbBdm: usbd_mini.irx failed (%d)\n", ret);
+        s_usb_bdm_loaded_result = -3;
+        return s_usb_bdm_loaded_result;
+    }
+
+    /* PS2SDK's HID boot-mouse driver attaches to the already-live
+       usbd_mini bus. This is deliberately best-effort: an unusual HID or
+       an import mismatch must not break USB mass storage. */
+    ret = EmbeddedIrxLoad(ps2mouse_irx, sizeof(ps2mouse_irx), 0, NULL);
+    BootImport("ps2mouse", ret);
+    if (ret < 0)
+    {
+        printf("UsbMouse: ps2mouse.irx unavailable (%d) -- continuing without mouse\n", ret);
+        s_usb_mouse_loaded_result = ret;
+    }
+    else
+    {
+        s_usb_mouse_loaded_result = 0;
+    }
+
+    ret = EmbeddedIrxLoad(usbmass_bd_irx, sizeof(usbmass_bd_irx), 0, NULL);
+    BootImport("usbmass_bd", ret);
+    if (ret < 0)
+    {
+        printf("UsbBdm: usbmass_bd.irx failed (%d)\n", ret);
+        s_usb_bdm_loaded_result = -4;
+        return s_usb_bdm_loaded_result;
+    }
+
+    /* HD INTERNO (APA): dev9 + ps2atad + ps2hdd -- DESABILITADO no boot.
+     *
+     * REGRESSAO confirmada em hardware real (Adriano): carregar estes 3
+     * modulos aqui dava TELA PRETA no boot (testado em FAT32 e exFAT).
+     * Motivo: EmbeddedIrxLoad usa SifExecModuleBuffer, que e' SINCRONO;
+     * a rotina de init do ps2dev9/ps2hdd fica esperando o hardware DEV9/
+     * ATA e, em muitos consoles, NAO retorna -> o boot congela ANTES do
+     * video inicializar (por isso nem o splash aparece).  O "best-effort"
+     * assumido antes estava errado: o load em si JA bloqueia, nao so' o
+     * waitUntilDeviceIsReady() do ps2_drivers.
+     *
+     * O USB (usbd_mini/bdm/bdmfs_fatfs/usbmass_bd, acima) continua intacto.
+     * Suporte a hdd0: vai voltar depois como carga PREGUICOSA -- so' no
+     * primeiro uso pelo browser/BGM e com HDD Support ligado -- para nunca
+     * tocar o boot padrao.
+     *
+     *   ret = EmbeddedIrxLoad(ps2dev9_irx, sizeof(ps2dev9_irx), 0, NULL);
+     *   ret = EmbeddedIrxLoad(ps2atad_irx, sizeof(ps2atad_irx), 0, NULL);
+     *   ret = EmbeddedIrxLoad(ps2hdd_irx,  sizeof(ps2hdd_irx),  0, NULL);
+     */
+
+    s_usb_bdm_loaded_result = 0;
+    return s_usb_bdm_loaded_result;
+}
+
+/* HD INTERNO (APA) -- carga PREGUICOSA e opcional.
+ *
+ * Por que separado do UsbBdm: a init do ps2dev9/ps2hdd e' SINCRONA e,
+ * em consoles sem HD (ou com DEV9 problematico), NAO retorna -> travava
+ * o boot inteiro (tela preta).  Aqui isso so' roda quando o usuario
+ * ESCOLHE usar hdd0: no browser/BGM, e so' se o toggle estiver ligado. No
+ * pior caso, afeta apenas o primeiro acesso ao hdd0: de quem ligou a opcao,
+ * nunca o boot padrao. Mesma filosofia do "HDD device start mode" do OPL:
+ * padrao DESLIGADO, quem tem HD liga. */
+static int s_hdd_enabled = 0;   /* toggle (persistido no video.cfg) */
+static int s_hdd_loaded  = 0;   /* modulos ja carregados nesta sessao */
+static char s_hdd_mounted[128] = { 0 };
+
+/* HD INTERNO (exFAT/FAT via BDM) -- carga PREGUICOSA e opcional, MUTUAMENTE
+ * EXCLUSIVA com o modo APA acima: ps2atad e atad_bd registram a mesma
+ * library "atad" 1.3, entao apenas um deles pode residir no IOP por sessao.
+ * A pilha e' dev9 -> atad_bd; o BDM e o bdmfs_fatfs (UTF-8 LFN) ja' sobem
+ * no boot, entao o disco FAT/exFAT aparece como ata0:/ata1: logo apos a
+ * carga. Disco inteiro sem tabela de particoes (superfloppy) tambem e'
+ * montado: o bdmfs_fatfs tenta o boot sector direto quando MBR/GPT falham. */
+static int s_ata_bd_enabled    = 0;  /* toggle (persistido no video.cfg) */
+static int s_ata_bd_loaded     = 0;  /* atad_bd ja carregado nesta sessao */
+static int s_ata_bd_last_error = 0;
+
+extern "C" int HddSupportIsEnabled(void)
+{
+    return s_hdd_enabled;
+}
+
+extern "C" int HddNeedsRestart(void)
+{
+    /* O modo exFAT (atad_bd) ja carregou a library atad nesta sessao:
+       trocar para APA so' entra em vigor apos reiniciar. */
+    return (s_hdd_enabled && s_ata_bd_loaded) ? 1 : 0;
+}
+
+extern "C" void HddSupportSetEnabled(int enabled)
+{
+    s_hdd_enabled = enabled ? 1 : 0;
+
+    /* O HD interno tem dois modos MUTUAMENTE EXCLUSIVOS: APA (hdd0:, via
+       ps2atad+ps2hdd+ps2fs) ou exFAT/FAT (ata0:, via atad_bd+BDM).  Ambos
+       registram a library "atad" 1.3 no IOP, entao so' um pode carregar
+       por sessao.  Ligar um desliga o outro (mesmo padrao do toggle
+       MMCE/MX4SIO: o recem-escolhido vence; modulo ja' residente nao e'
+       descarregado, o AtaBdNeedsRestart/HddNeedsRestart avisa). */
+    if (s_hdd_enabled)
+        s_ata_bd_enabled = 0;
+}
+
+extern "C" int HddLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (!s_hdd_enabled) return -1;   /* desligado: nem tenta */
+    if (s_hdd_loaded)   return 0;    /* ja carregado: no-op */
+
+    if (s_ata_bd_loaded)
+    {
+        /* O atad_bd (modo exFAT) ja registrou a library atad nesta sessao;
+           a pilha APA precisa de um IOP limpo.  Reinicie para trocar de modo. */
+        return EMBEDDED_IRX_ERROR_RESTART_REQUIRED;
+    }
+
+    /* dev9 -> ps2atad -> ps2hdd (expoe hdd0: no formato APA) -> ps2fs (PFS,
+       para montar/ler dentro das particoes via pfs0:).  dev9 pode ja' estar
+       carregado (stack de rede); o erro de duplicado e' ignorado.
+
+       IMPORTANTE: ps2hdd e ps2fs PRECISAM de argumentos (-o/-n/-m) para
+       alocar as tabelas internas de arquivos/buffers.  Sem eles, o ps2hdd
+       nao inicializa direito e o primeiro dopen("hdd0:") (listar particoes)
+       crasha.  Os valores batem com o wLaunchELF/OPL. */
+    static const char hddarg[] = "-o\0" "4\0" "-n\0" "20";   /* 4 open, 20 buffers */
+    static const char pfsarg[] = "-m\0" "4\0" "-o\0" "10\0" "-n\0" "40"; /* 4 mount, 10 open, 40 buf */
+
+    ret = Dev9LoadEmbeddedIrxOnce();
+    printf("HddLoad: dev9 = %d\n", ret);
+    if (ret < 0) return -1;
+
+    ret = EmbeddedIrxLoad(ps2atad_irx, sizeof(ps2atad_irx), 0, NULL);
+    printf("HddLoad: atad = %d\n", ret);
+    if (ret < 0) return -2;
+
+    ret = EmbeddedIrxLoad(ps2hdd_irx,  sizeof(ps2hdd_irx),  sizeof(hddarg), hddarg);
+    printf("HddLoad: hdd  = %d\n", ret);
+    if (ret < 0) return -3;
+
+#ifdef HAVE_PS2FS
+    ret = EmbeddedIrxLoad(ps2fs_irx,   sizeof(ps2fs_irx),   sizeof(pfsarg), pfsarg);
+    printf("HddLoad: pfs  = %d\n", ret);
+    if (ret < 0) return -4;
+#else
+    printf("HddLoad: pfs  = (nao embutido)\n");
+    return -4;
+#endif
+
+    s_hdd_loaded = 1;
+    return 0;
+}
+
+/* Traduz um caminho da UI no formato "hdd0:/PARTICAO/resto" para o caminho
+ * real do PFS, montando pfs0: na particao (remonta se a particao mudou).
+ *   - "hdd0:" ou "hdd0:/"  -> escreve "" em out e retorna 2 (LISTA de
+ *     particoes; o chamador deve usar fileXioDopen("hdd0:")).
+ *   - "hdd0:/PART/sub"     -> monta pfs0:=hdd0:PART, escreve "pfs0:/sub",
+ *     retorna 1.
+ *   - falha ao montar      -> retorna -1.
+ *   - nao e' caminho hdd0: -> retorna 0 (out inalterado).
+ * Mantem uma unica particao montada de cada vez (pfs0:). */
+extern "C" int HddMapPath(const char *uiPath, char *out, int outsz)
+{
+    if (!uiPath || strncmp(uiPath, "hdd0:", 5) != 0)
+        return 0;
+
+    const char *p = uiPath + 5;          /* depois de "hdd0:" */
+    while (*p == '/') p++;               /* pula barras -> "PART/..." ou "" */
+    if (*p == 0)                         /* lista de particoes */
+    {
+        if (out && outsz) out[0] = 0;
+        return 2;
+    }
+
+    char part[128];
+    int i = 0;
+    while (p[i] && p[i] != '/' && i < (int)sizeof(part) - 1) { part[i] = p[i]; i++; }
+    part[i] = 0;
+    const char *rest = p + i;            /* "/sub/..." ou "" */
+
+    if (strcmp(s_hdd_mounted, part) != 0)    /* montar/remontar pfs0: */
+    {
+        if (s_hdd_mounted[0])
+        {
+            fileXioUmount("pfs0:");
+            s_hdd_mounted[0] = 0;
+        }
+        char dev[160];
+        snprintf(dev, sizeof(dev), "hdd0:%s", part);
+        if (fileXioMount("pfs0:", dev, FIO_MT_RDWR) < 0)
+            return -1;
+        strncpy(s_hdd_mounted, part, sizeof(s_hdd_mounted) - 1);
+        s_hdd_mounted[sizeof(s_hdd_mounted) - 1] = 0;
+    }
+
+    if (out && outsz)
+        snprintf(out, outsz, "pfs0:%s", (*rest) ? rest : "/");
+    return 1;
+}
+
+/* ---- HD interno (exFAT/FAT via BDM): atad_bd ---- */
+
+extern "C" int AtaBdSupportIsEnabled(void)
+{
+    return s_ata_bd_enabled;
+}
+
+extern "C" void AtaBdSupportSetEnabled(int enabled)
+{
+    s_ata_bd_enabled = enabled ? 1 : 0;
+
+    /* Mutua exclusao com o modo APA (hdd0:) -- ver comentario do bloco
+       HddSupportSetEnabled acima. */
+    if (s_ata_bd_enabled)
+        s_hdd_enabled = 0;
+}
+
+extern "C" int AtaBdNeedsRestart(void)
+{
+    /* O modo oposto ja carregou seus modulos ATAD nesta sessao: trocar
+       de modo so' entra em vigor apos reiniciar. */
+    return (s_ata_bd_enabled && s_hdd_loaded) ? 1 : 0;
+}
+
+extern "C" int AtaBdIsLoaded(void)
+{
+    return s_ata_bd_loaded;
+}
+
+extern "C" int AtaBdGetLastError(void)
+{
+    return s_ata_bd_last_error;
+}
+
+extern "C" int AtaBdLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (!s_ata_bd_enabled) return -1;   /* desligado: nem tenta */
+    if (s_ata_bd_loaded)   return 0;    /* ja carregado: no-op */
+
+    if (s_hdd_loaded)
+    {
+        /* A pilha APA (ps2atad) ja registrou a library atad; carregar o
+           atad_bd agora falharia com library duplicada. */
+        s_ata_bd_last_error = EMBEDDED_IRX_ERROR_RESTART_REQUIRED;
+        return s_ata_bd_last_error;
+    }
+
+    /* dev9 e' o barramento do ATAD (mesma dependencia da pilha APA e da
+       rede); duplicado ja' carregado e' ignorado pelo Dev9LoadEmbeddedIrxOnce. */
+    ret = Dev9LoadEmbeddedIrxOnce();
+    printf("AtaBdLoad: dev9 = %d\n", ret);
+    if (ret < 0) { s_ata_bd_last_error = -1; return -1; }
+
+    /* atad_bd (ATAD+BDM): conecta o HD como block device "ata" no BDM ja'
+       residente; o bdmfs_fatfs (boot) monta FAT/exFAT em ata0:/ata1:. */
+    ret = EmbeddedIrxLoad(atad_bd_irx, sizeof(atad_bd_irx), 0, NULL);
+    printf("AtaBdLoad: atad_bd = %d\n", ret);
+    if (ret < 0) { s_ata_bd_last_error = -2; return -2; }
+
+    s_ata_bd_loaded = 1;
+    s_ata_bd_last_error = 0;
+    return 0;
+}
+
+/* MMCE and MX4SIO both hook the active sio2man transport.  wLaunchELF builds
+ * either feature against the same homebrew SIO2 stack; dynamically stacking
+ * both hooks is unsafe and has caused SIO2 deadlocks on real hardware.
+ *
+ * One backend therefore owns SIO2 for the rest of this IOP session.  Changing
+ * the configured backend is still allowed, but takes effect after reboot,
+ * where the normal single IOP reset starts from a clean module table. */
+enum StorageSio2Backend
+{
+    STORAGE_SIO2_NONE = 0,
+    STORAGE_SIO2_MMCE,
+    STORAGE_SIO2_MX4SIO
+};
+
+enum { MMCE_DEVCTL_PING = 0x01 };
+
+static int s_storage_sio2_backend = STORAGE_SIO2_NONE;
+
+static int s_mmce_enabled    = 0;  /* toggle persisted in video.cfg */
+static int s_mmce_loaded     = 0;
+static int s_mmce_slot_mask  = -1; /* -1 = not probed, bits 0/1 = ports */
+static int s_mmce_last_error = 0;
+
+static int s_mx4sio_enabled    = 0;
+static int s_mx4sio_loaded     = 0;
+static int s_mx4sio_last_error = 0;
+
+extern "C" int MmceSupportIsEnabled(void)
+{
+    return s_mmce_enabled;
+}
+
+extern "C" void MmceSupportSetEnabled(int enabled)
+{
+    int next = enabled ? 1 : 0;
+
+    if (next != s_mmce_enabled)
+    {
+        s_mmce_slot_mask = -1;
+        s_mmce_last_error = 0;
+    }
+    s_mmce_enabled = next;
+
+    /* The newly selected backend wins old configs that accidentally enabled
+       both features.  An already resident opposite backend is not unloaded;
+       MmceNeedsRestart() reports that safe pending state. */
+    if (next)
+    {
+        s_mx4sio_enabled = 0;
+    }
+}
+
+extern "C" int MmceLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (!s_mmce_enabled) return -1;
+    if (s_mmce_loaded)   return 0;
+
+    if (s_storage_sio2_backend == STORAGE_SIO2_MX4SIO)
+    {
+        s_mmce_last_error = EMBEDDED_IRX_ERROR_RESTART_REQUIRED;
+        return s_mmce_last_error;
+    }
+
+    ret = EmbeddedIrxLoad(mmceman_irx, sizeof(mmceman_irx), 0, NULL);
+    printf("MmceLoad: mmceman = %d\n", ret);
+    if (ret < 0)
+    {
+        s_mmce_last_error = ret;
+        return ret;
+    }
+
+    s_mmce_loaded = 1;
+    s_mmce_slot_mask = -1;
+    s_mmce_last_error = 0;
+    s_storage_sio2_backend = STORAGE_SIO2_MMCE;
+    return 0;
+}
+
+extern "C" int MmceProbeAvailableSlots(void)
+{
+    int slot;
+    int mask = 0;
+
+    if (MmceLoadEmbeddedIrx() < 0)
+    {
+        return 0;
+    }
+    if (s_mmce_slot_mask >= 0)
+    {
+        return s_mmce_slot_mask;
+    }
+
+    /* MMCEMAN command 1 is MMCE_CMD_PING.  Loading the IRX only proves that
+       its SIO2 hook and filesystem registered; this command proves that an
+       MMCE device actually answered on the corresponding physical port. */
+    for (slot = 0; slot < 2; slot++)
+    {
+        char device[] = "mmce0:";
+        int ping_result;
+
+        device[4] = (char)('0' + slot);
+        ping_result = fileXioDevctl(
+            device,
+            MMCE_DEVCTL_PING,
+            NULL,
+            0,
+            NULL,
+            0
+        );
+        printf("MmceProbe: %s ping = %d\n", device, ping_result);
+        if (ping_result >= 0)
+        {
+            mask |= 1 << slot;
+        }
+    }
+
+    s_mmce_slot_mask = mask;
+    return s_mmce_slot_mask;
+}
+
+extern "C" int MmceGetAvailableSlots(void)
+{
+    return s_mmce_slot_mask < 0 ? 0 : s_mmce_slot_mask;
+}
+
+extern "C" int MmceIsLoaded(void)
+{
+    return s_mmce_loaded;
+}
+
+extern "C" int MmceGetLastError(void)
+{
+    return s_mmce_last_error;
+}
+
+extern "C" int MmceNeedsRestart(void)
+{
+    return s_mmce_enabled &&
+           s_storage_sio2_backend == STORAGE_SIO2_MX4SIO;
+}
+
+/* ------------------------------------------------------------------------
+ * Toggles de dispositivos SEM modulo proprio de carga preguicosa:
+ *
+ *  - Mass (USB): a stack USB (usbd_mini/bdm/bdmfs_fatfs/usbmass_bd) SEMPRE sobe
+ *    no boot -- e' o armazenamento principal e seguro, e gatear isso no
+ *    boot mexeria no caminho critico que causava a tela preta.  Este flag
+ *    so' controla a LISTAGEM de mass0:/mass1: no browser e a carga do
+ *    mx4sio (abaixo).  Padrao LIGADO.
+ *  - SMB (smb:): compartilhamento de rede para ROMs. O toggle controla a
+ *    listagem; a rede, o smbman e a autenticacao so' sobem quando o usuario
+ *    abre smb:. Padrao DESLIGADO.
+ * ------------------------------------------------------------------------ */
+static int s_mass_enabled = 1;   /* padrao LIGADO */
+static int s_smb_enabled = 0;    /* padrao DESLIGADO */
+
+extern "C" int  MassStorageIsEnabled(void)   { return s_mass_enabled; }
+extern "C" void MassStorageSetEnabled(int e) { s_mass_enabled = e ? 1 : 0; }
+extern "C" int  SmbSupportIsEnabled(void)     { return s_smb_enabled; }
+extern "C" void SmbSupportSetEnabled(int e)   { s_smb_enabled = e ? 1 : 0; }
+
+extern "C" int Mx4sioIsEnabled(void)
+{
+    return s_mx4sio_enabled;
+}
+
+extern "C" void Mx4sioSetEnabled(int enabled)
+{
+    int next = enabled ? 1 : 0;
+
+    if (next != s_mx4sio_enabled)
+    {
+        s_mx4sio_last_error = 0;
+    }
+    s_mx4sio_enabled = next;
+    if (next)
+    {
+        s_mmce_enabled = 0;
+        s_mmce_slot_mask = -1;
+    }
+}
+
+extern "C" int Mx4sioLoadIfEnabled(void)
+{
+    int ret;
+
+    if (!s_mx4sio_enabled) return -1;
+    if (s_mx4sio_loaded)   return 0;
+
+    if (s_storage_sio2_backend == STORAGE_SIO2_MMCE)
+    {
+        s_mx4sio_last_error = EMBEDDED_IRX_ERROR_RESTART_REQUIRED;
+        return s_mx4sio_last_error;
+    }
+
+    ret = EmbeddedIrxLoad(mx4sio_bd_irx, sizeof(mx4sio_bd_irx), 0, NULL);
+    printf("Mx4sioLoad: mx4sio_bd = %d\n", ret);
+    if (ret < 0)
+    {
+        s_mx4sio_last_error = ret;
+        return ret;
+    }
+
+    s_mx4sio_loaded = 1;
+    s_mx4sio_last_error = 0;
+    s_storage_sio2_backend = STORAGE_SIO2_MX4SIO;
+    return 0;
+}
+
+extern "C" int Mx4sioIsLoaded(void)
+{
+    return s_mx4sio_loaded;
+}
+
+extern "C" int Mx4sioGetLastError(void)
+{
+    return s_mx4sio_last_error;
+}
+
+extern "C" int Mx4sioNeedsRestart(void)
+{
+    return s_mx4sio_enabled &&
+           s_storage_sio2_backend == STORAGE_SIO2_MMCE;
+}
+
+/* Network IRX stack bring-up.
+ *
+ * Mirrors the order used by hugorsgarcia/PS2SNESticle, picodrive,
+ * uLaunchELF, OPL and every other modern PS2 homebrew that uses the
+ * PS2SDK netman + ps2ip stack:
+ *
+ *   1. ps2dev9.irx - DEV9 bus driver, required by SMAP.
+ *   2. netman.irx  - link-layer abstraction that sits between the NIC
+ *                    driver and the TCP/IP stack.  Must come up before
+ *                    smap.irx tries to register, since the modern
+ *                    smap binary built into PS2SDK
+ *                    ($(PS2SDK)/iop/irx/smap.irx) is the netman-aware
+ *                    variant.
+ *   3. NetManInit  - binds the EE side before SMAP registers with netman.
+ *   4. smap.irx    - Sony Multi-Application Player ethernet driver
+ *                    (the Network Adapter NIC).
+ *   5. ps2ip.irx   - lwIP TCP/IP stack on the IOP side.  Talks to
+ *                    smap through netman.  After this one is up the
+ *                    EE can call ps2ipInit() / ps2ip_setconfig() and
+ *                    open BSD sockets through <sys/socket.h>.
+ *
+ * The IRX images themselves are bin2c'd into the ELF (see Makefile
+ * rules for EMBED_IRX_NAMES) so we do not need ps2dev9.irx /
+ * netman.irx / smap.irx / ps2ip.irx to exist on disk next to the ELF.
+ *
+ * NetManInit() deliberately happens immediately after netman.irx and before
+ * smap.irx. This is the order used by OPL and prevents SMAP link events from
+ * being lost before the EE RPC endpoint exists.
+ *
+ * Returns 0 on success, or a negative value indicating which IRX
+ * failed:
+ *   -1 ps2dev9.irx
+ *   -2 netman.irx
+ *   -3 NetManInit
+ *   -4 smap.irx
+ *   -5 ps2ip.irx
+ *
+ * Safe to call multiple times -- subsequent calls return the cached
+ * result.
+ */
+static int s_netif_loaded_result = 1; /* 1 = not yet attempted */
+
+extern "C" int NetIfLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_netif_loaded_result != 1)
+        return s_netif_loaded_result;
+
+    ret = Dev9LoadEmbeddedIrxOnce();
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: ps2dev9.irx failed (%d)\n", ret);
+        s_netif_loaded_result = -1;
+        return s_netif_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(netman_irx, sizeof(netman_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: netman.irx failed (%d)\n", ret);
+        s_netif_loaded_result = -2;
+        return s_netif_loaded_result;
+    }
+
+    /* AURORA_SMB_IOP_STACK_V3_20260827
+     * SMBMAN runs on the IOP and imports lwip_socket/lwip_connect/etc from
+     * the IOP-side ps2ip module. Match OPL's architecture:
+     * DEV9 -> NETMAN -> NetManInit -> SMAP -> ps2ip-nm -> ps2ips.
+     */
+    ret = NetManInit();
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: NetManInit failed (%d)\n", ret);
+        s_netif_loaded_result = -3;
+        return s_netif_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(smap_irx, sizeof(smap_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: smap.irx failed (%d)\n", ret);
+        s_netif_loaded_result = -4;
+        return s_netif_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(ps2ip_irx, sizeof(ps2ip_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: ps2ip-nm.irx failed (%d)\n", ret);
+        s_netif_loaded_result = -5;
+        return s_netif_loaded_result;
+    }
+
+    ret = EmbeddedIrxLoad(ps2ips_irx, sizeof(ps2ips_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("NetIfLoadEmbeddedIrx: ps2ips.irx failed (%d)\n", ret);
+        s_netif_loaded_result = -6;
+        return s_netif_loaded_result;
+    }
+
+    s_netif_loaded_result = 0;
+    return 0;
+}
+
+/* SMB filesystem driver. It is intentionally loaded only after the network
+ * stack has an address and only when the user enters smb:. smbman registers
+ * the normal iomanX "smb:" device, so the browser, ZIP reader and ROM loader
+ * keep using the same fileXio/newlib read path as local devices. */
+static int s_smb_loaded_result = 1; /* 1 = not yet attempted */
+
+extern "C" int SmbLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_smb_loaded_result != 1) return s_smb_loaded_result;
+
+    ret = EmbeddedIrxLoad(smbman_irx, sizeof(smbman_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("SmbLoadEmbeddedIrx: smbman.irx failed (%d)\n", ret);
+        s_smb_loaded_result = ret;
+        return ret;
+    }
+
+    s_smb_loaded_result = 0;
+    return 0;
+}
+
+/* Pad IRX stack bring-up.
+ *
+ * Modern PS2SDK-based controller stack.  Previously the project relied
+ * on the BIOS-resident \"rom0:XSIO2MAN + rom0:XMTAPMAN + rom0:XPADMAN\"
+ * trio loaded from src/platform/ps2/system/mainloop_iop.cpp.  That path
+ * works under PCSX2 / NetherSX2 because their emulated rom0: modules
+ * tolerate co-existing with the modern sio2man.irx we already load for
+ * the memory-card stack.  On a real PS2, however, XSIO2MAN tries to
+ * register the same SIO2 RPC services that the modern sio2man has
+ * already claimed, so XSIO2MAN loads but its RPC server never becomes
+ * usable; XPADMAN then opens but cannot talk to its SIO2 transport,
+ * and the controller silently never reports any data -- which is the
+ * exact symptom users see (\"menu shows up but controller does not
+ * respond on retail PS2 only\").
+ *
+ * The fix is the same pattern picodrive PS2, OPL, uLaunchELF and
+ * hugorsgarcia/PS2SNESticle use: stack the PS2SDK padman.irx
+ * (and optional mtapman.irx for multitap) on top of the modern
+ * sio2man.irx that the memcard bring-up already loaded.  PS2SDK
+ * libpad understands this padman natively and is what the EE-side
+ * input layer (src/platform/ps2/input/input.cpp) talks to via
+ * padInit / padPortOpen / padRead.
+ *
+ * Order:
+ *   1. padman.irx   - SIO2-based controller manager.  REQUIRED.
+ *                     sio2man.irx must already be loaded (by
+ *                     MemCardLoadEmbeddedIrx).
+ *   2. mtapman.irx  - multitap manager.  OPTIONAL.  Lets the player
+ *                     plug 3-5 controllers via a multitap on port 1/2.
+ *                     If it fails to load we still keep going with
+ *                     only the two physical pad slots.
+ *
+ * Returns 0 on success.  Returns -1 if padman failed (fatal -- caller
+ * should not call padInit / InputInit).  mtapman failures map to
+ * still-success because they only disable multitap, not the base pad.
+ * Safe to call multiple times -- subsequent calls return the cached
+ * result.
+ */
+static int s_pad_loaded_result = 1; /* 1 = not yet attempted */
+
+extern "C" int PadLoadEmbeddedIrx(void)
+{
+    int ret;
+
+    if (s_pad_loaded_result != 1) return s_pad_loaded_result;
+
+    ret = EmbeddedIrxLoad(padman_irx, sizeof(padman_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("PadLoadEmbeddedIrx: padman.irx failed (%d)\n", ret);
+        s_pad_loaded_result = -1;
+        return s_pad_loaded_result;
+    }
+
+    /* mtapman is best-effort. Failure here just means no multitap
+       support; the base two-controller path keeps working. */
+    ret = EmbeddedIrxLoad(mtapman_irx, sizeof(mtapman_irx), 0, NULL);
+    if (ret < 0)
+    {
+        printf("PadLoadEmbeddedIrx: mtapman.irx failed (%d) "
+               "- multitap disabled, base pads still OK\n", ret);
+    }
+
+    s_pad_loaded_result = 0;
+    return 0;
+}
+
+extern "C" void EmbeddedIrxResetRuntimeState(void)
+{
+    /* An IOP reset destroys every resident module and mount.  Keeping any of
+       these EE-side caches set would skip a required reload and leave callers
+       talking to RPC services that no longer exist. */
+    s_memcard_loaded = 0;
+    s_cdfs_loaded_result = 1;
+    s_usb_bdm_loaded_result = 1;
+    s_usb_mouse_loaded_result = 1;
+    s_dev9_loaded_result = 1;
+    s_hdd_loaded = 0;
+    s_hdd_mounted[0] = 0;
+    s_ata_bd_loaded = 0;
+    s_ata_bd_last_error = 0;
+
+    s_mmce_loaded = 0;
+    s_mmce_slot_mask = -1;
+    s_mmce_last_error = 0;
+    s_mx4sio_loaded = 0;
+    s_mx4sio_last_error = 0;
+    s_storage_sio2_backend = STORAGE_SIO2_NONE;
+
+    s_netif_loaded_result = 1;
+    s_smb_loaded_result = 1;
+    s_pad_loaded_result = 1;
+}
