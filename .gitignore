@@ -1,0 +1,51 @@
+# Build output
+build/
+refs/
+logs/
+
+# Reference / analysis material (not needed to build)
+ref/
+tools/upstream-gb/
+
+# Compiled/generated files
+*.o
+*.elf
+*.log
+*.tar.gz
+*.bak*
+
+# Local one-off Python/text scripts (root)
+*.py
+
+# Build-critical tool scripts must be committed
+!tools/*.py
+
+# Local helper scripts
+backup.sh
+copy.sh
+/dis_epc.sh
+/dis2.sh
+/dis3.sh
+
+# Local PS2DEV environment
+.ps2dev-env
+
+# Editor/temp files
+.#*
+*~
+.tmp_*
+
+# AI IDE working data
+.trae/
+.workbuddy/
+
+# Python cache
+__pycache__/
+
+# Root working files (not referenced by the build)
+/24
+/背景.png
+
+src/platform/ps2/iop/aurora_ps2mouse/*.elf
+src/platform/ps2/iop/aurora_ps2mouse/*.irx
+src/platform/ps2/iop/aurora_ps2mouse/obj/

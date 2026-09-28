@@ -1,0 +1,22 @@
+# AURORA_GPSP_V1
+# PS2 static build wrapper for libretro/gpsp.
+#
+# gpSP ships an upstream platform=ps2 target that already carries the
+# PS2 tuning this port needs:
+#   -DHAVE_DYNAREC -DMIPS_ARCH      (MIPS32 dynarec, EE-friendly)
+#   -DUSE_XBGR1555_FORMAT           (GS-native A1B5G5R5 output)
+#   -DSMALL_TRANSLATION_CACHE       (ROM 2MiB / RAM 384KiB caches)
+#   -DROM_BUFFER_SIZE=16            (16 x 1MiB ROM LRU window)
+# The wrapper only delegates; the raw archive lands inside the pinned
+# checkout as gpsp_libretro_ps2.a, then Aurora namespaces it.
+
+.PHONY: all clean
+
+all:
+	@$(MAKE) --no-print-directory -C $(GPSP_DIR) platform=ps2 \
+		CC="$(CC)" CXX="$(CXX)" AR="$(AR)" \
+		PS2DEV="$(PS2DEV)" PS2SDK="$(PS2SDK)" \
+		HAVE_DYNAREC=1 STATIC_LINKING=1 all
+
+clean:
+	@$(MAKE) --no-print-directory -C $(GPSP_DIR) platform=ps2 clean

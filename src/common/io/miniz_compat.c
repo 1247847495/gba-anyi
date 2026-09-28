@@ -1,0 +1,1121 @@
+#include "miniz_compat.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define NEWLIB_PORT_AWARE
+#include <io_common.h>
+#include <fileXio.h>
+#include <fileXio_rpc.h>
+#undef NEWLIB_PORT_AWARE
+
+#include "miniz.h"
+
+/* All ROM-source paths reachable by the project are exposed by iomanX.
+   Slurp the compressed file once and hand it to miniz's memory reader, but
+   use direct fileXio calls: one large EE->IOP read avoids the repeated small
+   stdio RPCs that made ZIP/GZ launch noticeably slower on cdfs/mass/SMB. */
+
+/* AURORA_ZIP_FILEXIO_STREAM_V1_20260822
+ *
+ * fileXioRead(), like read(), is allowed to complete a request partially.
+ * Keep the existing fast direct-IOP path, but finish the request instead of
+ * treating the first short transfer as a corrupt archive.
+ *
+ * AURORA_ATA0_CHUNKED_READ_V1_20260905
+ * Never issue one giant fileXioRead for the whole archive: on the
+ * internal-HDD exFAT stack (atad_bd -> BDM -> bdmfs_fatfs) a single
+ * multi-megabyte READ hangs the IOP side and freezes the EE inside the
+ * RPC wait. Cap each request at 32 KiB, the same conservative chunk the
+ * ROM loader and OPL/wLaunchELF use. */
+#define FXIO_CHUNK_BYTES (32 * 1024)
+
+static int filexio_read_fully(int fd, void *buf, int size)
+{
+        unsigned char *dst = (unsigned char *)buf;
+        int total = 0;
+
+        if (fd < 0 || !buf || size < 0)
+                return -1;
+
+        while (total < size)
+        {
+                int want = size - total;
+                int n;
+                if (want > FXIO_CHUNK_BYTES)
+                        want = FXIO_CHUNK_BYTES;
+                n = fileXioRead(fd, dst + total, want);
+                if (n <= 0)
+                        return (total > 0) ? total : n;
+                total += n;
+        }
+
+        return total;
+}
+
+/* Use miniz's user-supplied random-access reader for ZIP archives.
+ *
+ * The previous implementation malloc()'d a second buffer as large as the
+ * complete .zip before decompression. Aurora now keeps the SNES, QuickNES
+ * and PicoDrive frontends in the same 32 MiB PS2 process, so that temporary
+ * whole-archive copy can fail even when the extracted ROM itself fits in
+ * the permanent _RomData buffer.
+ */
+typedef struct MinizFileXioReader
+{
+        int fd;
+        int size;
+        int pos;
+} MinizFileXioReader;
+
+static int miniz_filexio_reader_open(
+        const char *path, MinizFileXioReader *reader)
+{
+        int size;
+
+        if (!reader)
+                return -1;
+
+        reader->fd = -1;
+        reader->size = 0;
+        reader->pos = 0;
+
+        if (!path || !path[0])
+                return -1;
+
+        reader->fd = fileXioOpen(path, FIO_O_RDONLY, 0);
+        if (reader->fd < 0)
+                return -1;
+
+        size = fileXioLseek(reader->fd, 0, FIO_SEEK_END);
+        if (size <= 0)
+        {
+                fileXioClose(reader->fd);
+                reader->fd = -1;
+                return -1;
+        }
+
+        if (fileXioLseek(reader->fd, 0, FIO_SEEK_SET) < 0)
+        {
+                fileXioClose(reader->fd);
+                reader->fd = -1;
+                return -1;
+        }
+
+        reader->size = size;
+        reader->pos = 0;
+        return size;
+}
+
+static void miniz_filexio_reader_close(MinizFileXioReader *reader)
+{
+        if (!reader)
+                return;
+
+        if (reader->fd >= 0)
+                fileXioClose(reader->fd);
+
+        reader->fd = -1;
+        reader->size = 0;
+        reader->pos = 0;
+}
+
+static size_t miniz_filexio_read_func(
+        void *opaque, mz_uint64 file_ofs, void *buf, size_t n)
+{
+        MinizFileXioReader *reader = (MinizFileXioReader *)opaque;
+        unsigned char *dst = (unsigned char *)buf;
+        size_t total = 0;
+        size_t avail;
+
+        if (!reader || reader->fd < 0 || !buf || n == 0)
+                return 0;
+
+        if (file_ofs > 0x7FFFFFFFULL ||
+            file_ofs >= (mz_uint64)reader->size)
+                return 0;
+
+        avail = (size_t)((mz_uint64)reader->size - file_ofs);
+        if (n > avail)
+                n = avail;
+
+        if (reader->pos != (int)file_ofs)
+        {
+                int pos = fileXioLseek(
+                        reader->fd, (int)file_ofs, FIO_SEEK_SET);
+                if (pos < 0)
+                        return 0;
+                reader->pos = pos;
+        }
+
+        while (total < n)
+        {
+                size_t remain = n - total;
+                int want = (remain > FXIO_CHUNK_BYTES)
+                        ? FXIO_CHUNK_BYTES : (int)remain;
+                int got = fileXioRead(reader->fd, dst + total, want);
+
+                if (got <= 0)
+                        break;
+
+                total += (size_t)got;
+                reader->pos += got;
+        }
+
+        return total;
+}
+
+static int read_file_to_alloc(const char *path, void **out_buf, int *out_size)
+{
+        int fd;
+        int size;
+        int n;
+        void *buf;
+
+        if (!path || !path[0])
+                return -1;
+
+        /* Direct fileXio calls use IOP flags, not newlib/POSIX flags.
+           FIO_O_RDONLY is 1 while newlib O_RDONLY is 0. */
+        fd = fileXioOpen(path, FIO_O_RDONLY, 0);
+        if (fd < 0)
+                return -1;
+
+        size = fileXioLseek(fd, 0, FIO_SEEK_END);
+        if (size <= 0)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+        if (fileXioLseek(fd, 0, FIO_SEEK_SET) < 0)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+
+        buf = malloc((size_t)size);
+        if (!buf)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+
+        n = filexio_read_fully(fd, buf, size);
+        fileXioClose(fd);
+
+        if (n != size)
+        {
+                free(buf);
+                return -1;
+        }
+
+        *out_buf = buf;
+        *out_size = (int)size;
+        return (int)size;
+}
+
+/* Walks the variable-length gzip header (RFC 1952 section 2.3) and
+   returns the byte offset where the raw DEFLATE stream starts, or -1
+   if the buffer doesn't look like a valid gzip stream. */
+static int parse_gzip_header(const unsigned char *data, int len)
+{
+        unsigned char flags;
+        int off;
+
+        if (len < 10)
+                return -1;
+        if (data[0] != 0x1F || data[1] != 0x8B || data[2] != 8)
+                return -1;
+
+        flags = data[3];
+        off = 10;
+
+        if (flags & 0x04) /* FEXTRA */
+        {
+                int xlen;
+                if (off + 2 > len) return -1;
+                xlen = data[off] | (data[off + 1] << 8);
+                off += 2 + xlen;
+                if (off > len) return -1;
+        }
+        if (flags & 0x08) /* FNAME */
+        {
+                while (off < len && data[off] != 0) off++;
+                if (off >= len) return -1;
+                off++;
+        }
+        if (flags & 0x10) /* FCOMMENT */
+        {
+                while (off < len && data[off] != 0) off++;
+                if (off >= len) return -1;
+                off++;
+        }
+        if (flags & 0x02) /* FHCRC */
+        {
+                off += 2;
+                if (off > len) return -1;
+        }
+        return off;
+}
+
+/* AURORA_DYNAMIC_ROM_BUFFER_V1_20260823
+ * GZIP metadata/prefix preflight. ISIZE is RFC1952's uncompressed size
+ * modulo 2^32; supported ROMs are restricted far below that wrap point. */
+int MinizGetGZUncompressedSize(const char *path)
+{
+        int fd, file_size, n;
+        unsigned char tail[4];
+        unsigned int size;
+
+        if (!path || !path[0])
+                return -1;
+
+        fd = fileXioOpen(path, FIO_O_RDONLY, 0);
+        if (fd < 0)
+                return -1;
+
+        file_size = fileXioLseek(fd, 0, FIO_SEEK_END);
+        if (file_size < 18 ||
+            fileXioLseek(fd, file_size - 4, FIO_SEEK_SET) < 0)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+
+        n = filexio_read_fully(fd, tail, 4);
+        fileXioClose(fd);
+        if (n != 4)
+                return -1;
+
+        size = (unsigned int)tail[0] |
+               ((unsigned int)tail[1] << 8) |
+               ((unsigned int)tail[2] << 16) |
+               ((unsigned int)tail[3] << 24);
+        if (size == 0 || size > 0x7FFFFFFFU)
+                return -1;
+        return (int)size;
+}
+
+typedef struct MinizPrefixSink
+{
+        unsigned char *dst;
+        int capacity;
+        int written;
+} MinizPrefixSink;
+
+static int miniz_gz_prefix_sink(const void *buf, int len, void *user)
+{
+        MinizPrefixSink *sink = (MinizPrefixSink *)user;
+        int copy;
+
+        if (!sink || len < 0)
+                return 0;
+
+        copy = sink->capacity - sink->written;
+        if (copy > len)
+                copy = len;
+        if (copy > 0)
+        {
+                memcpy(sink->dst + sink->written, buf, (size_t)copy);
+                sink->written += copy;
+        }
+
+        /* Keep consuming so malformed deflate is not accepted as a probe. */
+        return 1;
+}
+
+int MinizReadGZPrefix(const char *path, void *out_buf, int out_max)
+{
+        void *gz_data = NULL;
+        int gz_size = 0, hdr, deflate_len, ok;
+        size_t in_size;
+        MinizPrefixSink sink;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+        if (read_file_to_alloc(path, &gz_data, &gz_size) <= 0)
+                return -1;
+
+        hdr = parse_gzip_header((const unsigned char *)gz_data, gz_size);
+        if (hdr < 0 || gz_size <= hdr + 8)
+        {
+                free(gz_data);
+                return -1;
+        }
+
+        deflate_len = gz_size - hdr - 8;
+        sink.dst = (unsigned char *)out_buf;
+        sink.capacity = out_max;
+        sink.written = 0;
+        in_size = (size_t)deflate_len;
+
+        ok = tinfl_decompress_mem_to_callback(
+                (const unsigned char *)gz_data + hdr,
+                &in_size, miniz_gz_prefix_sink, &sink, 0);
+
+        free(gz_data);
+        return ok ? sink.written : -1;
+}
+
+
+int MinizReadGZToBuffer(const char *path, void *out_buf, int out_max)
+{
+        void *gz_data = NULL;
+        int gz_size = 0;
+        int hdr;
+        int deflate_len;
+        size_t produced;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+
+        if (read_file_to_alloc(path, &gz_data, &gz_size) <= 0)
+                return -1;
+
+        hdr = parse_gzip_header((const unsigned char *)gz_data, gz_size);
+        if (hdr < 0 || gz_size <= hdr + 8)
+        {
+                free(gz_data);
+                return -1;
+        }
+
+        /* The DEFLATE payload lives between [hdr .. gz_size-8); the
+           trailing 8 bytes are the gzip CRC32 + ISIZE which miniz
+           does not need. */
+        deflate_len = gz_size - hdr - 8;
+
+        produced = tinfl_decompress_mem_to_mem(
+                out_buf, (size_t)out_max,
+                (const unsigned char *)gz_data + hdr, (size_t)deflate_len,
+                0 /* raw deflate, not zlib-wrapped */);
+
+        free(gz_data);
+
+        if (produced == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED)
+                return -1;
+
+        return (int)produced;
+}
+
+int MinizReadZipFirstMatch(const char *path,
+                           void *out_buf,
+                           int out_max,
+                           char *out_filename,
+                           int filename_max,
+                           int (*name_filter)(const char *name))
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_uint num_files;
+        mz_uint i;
+        int result = -1;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+
+        if (miniz_filexio_reader_open(path, &reader) <= 0)
+                return -1;
+
+        memset(&zip, 0, sizeof(zip));
+        zip.m_pRead = miniz_filexio_read_func;
+        zip.m_pIO_opaque = &reader;
+
+        if (!mz_zip_reader_init(&zip, (mz_uint64)reader.size, 0))
+        {
+                miniz_filexio_reader_close(&reader);
+                return -1;
+        }
+
+        num_files = mz_zip_reader_get_num_files(&zip);
+        for (i = 0; i < num_files; i++)
+        {
+                mz_zip_archive_file_stat st;
+                if (!mz_zip_reader_file_stat(&zip, i, &st))
+                        continue;
+                if (st.m_is_directory)
+                        continue;
+                if (st.m_uncomp_size == 0)
+                        continue;
+                if (st.m_uncomp_size > (mz_uint64)out_max)
+                        continue;
+                if (name_filter && !name_filter(st.m_filename))
+                        continue;
+
+                if (mz_zip_reader_extract_to_mem(
+                                &zip, i, out_buf,
+                                (size_t)st.m_uncomp_size, 0))
+                {
+                        result = (int)st.m_uncomp_size;
+                        if (out_filename && filename_max > 0)
+                        {
+                                strncpy(out_filename, st.m_filename,
+                                        (size_t)(filename_max - 1));
+                                out_filename[filename_max - 1] = '\0';
+                        }
+                        break;
+                }
+        }
+
+        mz_zip_reader_end(&zip);
+        miniz_filexio_reader_close(&reader);
+        return result;
+}
+/* AURORA_DYNAMIC_ROM_BUFFER_V1_20260823
+ * ZIP preflight records a central-directory index. Final extraction uses that
+ * exact index, so a second scan cannot silently switch ROM members. */
+static int miniz_zip_open_reader(
+        const char *path, MinizFileXioReader *reader, mz_zip_archive *zip)
+{
+        if (miniz_filexio_reader_open(path, reader) <= 0)
+                return 0;
+
+        memset(zip, 0, sizeof(*zip));
+        zip->m_pRead = miniz_filexio_read_func;
+        zip->m_pIO_opaque = reader;
+        if (!mz_zip_reader_init(zip, (mz_uint64)reader->size, 0))
+        {
+                miniz_filexio_reader_close(reader);
+                return 0;
+        }
+        return 1;
+}
+
+static void miniz_zip_close_reader(
+        MinizFileXioReader *reader, mz_zip_archive *zip)
+{
+        mz_zip_reader_end(zip);
+        miniz_filexio_reader_close(reader);
+}
+
+/* AURORA_GBA_ARCHIVE_SINK_V1_20260911
+ * BSS pool backing every mz_zip allocation on the GBA archive paths
+ * (file extraction, memory-cart sink extraction, prefix probe). The
+ * memory-cart variant runs AFTER gpSP's retro_init has claimed up to
+ * 16 MiB of heap for the ROM cache, where even a 64 KiB malloc is not
+ * guaranteed. Bump allocator, reset as a whole when the reader closes;
+ * exhausting it simply fails the open/extract and the caller falls back
+ * to another launch path. */
+static unsigned char s_ZipPool[256 * 1024];
+static size_t s_ZipPoolUsed;
+
+static void *miniz_zip_pool_alloc(void *opaque, size_t items, size_t size)
+{
+        size_t bytes;
+        void *p;
+
+        (void)opaque;
+        if (items == 0 || size == 0 || items > (size_t)-1 / size)
+                return NULL;
+        bytes = (items * size + 15u) & ~(size_t)15u;
+        if (bytes > sizeof(s_ZipPool) - s_ZipPoolUsed)
+                return NULL;
+        p = s_ZipPool + s_ZipPoolUsed;
+        s_ZipPoolUsed += bytes;
+        return p;
+}
+
+static void miniz_zip_pool_free(void *opaque, void *p)
+{
+        (void)opaque;
+        (void)p; /* pool resets as a whole after the reader closes */
+}
+
+static int miniz_zip_open_reader_pooled(
+        const char *path, MinizFileXioReader *reader, mz_zip_archive *zip)
+{
+        if (miniz_filexio_reader_open(path, reader) <= 0)
+                return 0;
+
+        memset(zip, 0, sizeof(*zip));
+        zip->m_pRead = miniz_filexio_read_func;
+        zip->m_pIO_opaque = reader;
+        s_ZipPoolUsed = 0;
+        zip->m_pAlloc = miniz_zip_pool_alloc;
+        zip->m_pFree = miniz_zip_pool_free;
+        if (!mz_zip_reader_init(zip, (mz_uint64)reader->size, 0))
+        {
+                miniz_filexio_reader_close(reader);
+                s_ZipPoolUsed = 0;
+                return 0;
+        }
+        return 1;
+}
+
+static void miniz_zip_close_reader_pooled(
+        MinizFileXioReader *reader, mz_zip_archive *zip)
+{
+        mz_zip_reader_end(zip); /* pool free is a no-op */
+        s_ZipPoolUsed = 0;
+        miniz_filexio_reader_close(reader);
+}
+
+/* Trampoline adapting MinizSinkFn to miniz's mz_file_write_func ABI
+ * (mz_uint64 file_ofs). */
+typedef struct MinizSinkCtx
+{
+        MinizSinkFn sink;
+        void *opaque;
+} MinizSinkCtx;
+
+static size_t miniz_sink_trampoline(void *opaque, mz_uint64 file_ofs,
+                                    const void *buf, size_t n)
+{
+        MinizSinkCtx *ctx = (MinizSinkCtx *)opaque;
+
+        if (!ctx || !ctx->sink || !buf)
+                return 0;
+        return ctx->sink(ctx->opaque, (unsigned long long)file_ofs, buf, n);
+}
+
+/* Early-stopping prefix sink for MinizReadZipEntryPrefixEarly: copies
+ * while capacity remains, then returns short so miniz aborts the walk
+ * right after the first out_max bytes (only a few KB of the compressed
+ * stream are ever read). */
+typedef struct MinizZipPrefixOutCtx
+{
+        unsigned char *dst;
+        int capacity;
+} MinizZipPrefixOutCtx;
+
+static size_t miniz_zip_prefix_out_sink(void *opaque, mz_uint64 file_ofs,
+                                        const void *buf, size_t n)
+{
+        MinizZipPrefixOutCtx *ctx = (MinizZipPrefixOutCtx *)opaque;
+        size_t room, copy;
+
+        if (!ctx || !buf || n == 0)
+                return 0;
+        if (file_ofs >= (mz_uint64)ctx->capacity)
+                return 0; /* done: abort the extraction */
+        room = (size_t)ctx->capacity - (size_t)file_ofs;
+        copy = (n < room) ? n : room;
+        memcpy(ctx->dst + (size_t)file_ofs, buf, copy);
+        return copy;
+}
+
+int MinizProbeZipFirstMatchInfo(const char *path,
+                                unsigned int *out_file_index,
+                                char *out_filename,
+                                int filename_max,
+                                MinizZipEntryFilter entry_filter)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_uint i, num_files;
+        int result = -1;
+
+        if (!out_file_index)
+                return -1;
+        if (!miniz_zip_open_reader(path, &reader, &zip))
+                return -1;
+
+        num_files = mz_zip_reader_get_num_files(&zip);
+        for (i = 0; i < num_files; ++i)
+        {
+                mz_zip_archive_file_stat st;
+                if (!mz_zip_reader_file_stat(&zip, i, &st))
+                        continue;
+                if (st.m_is_directory || !st.m_is_supported)
+                        continue;
+                if (st.m_uncomp_size == 0 ||
+                    st.m_uncomp_size > 0x7FFFFFFFULL)
+                        continue;
+                if (entry_filter &&
+                    !entry_filter(st.m_filename,
+                                  (unsigned int)st.m_uncomp_size))
+                        continue;
+
+                *out_file_index = (unsigned int)i;
+                result = (int)st.m_uncomp_size;
+                if (out_filename && filename_max > 0)
+                {
+                        strncpy(out_filename, st.m_filename,
+                                (size_t)(filename_max - 1));
+                        out_filename[filename_max - 1] = '\0';
+                }
+                break;
+        }
+
+        miniz_zip_close_reader(&reader, &zip);
+        return result;
+}
+
+int MinizReadZipEntryToBuffer(const char *path,
+                              unsigned int file_index,
+                              void *out_buf,
+                              int out_max,
+                              char *out_filename,
+                              int filename_max)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_zip_archive_file_stat st;
+        int result = -1;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+        if (!miniz_zip_open_reader(path, &reader, &zip))
+                return -1;
+
+        if (file_index < mz_zip_reader_get_num_files(&zip) &&
+            mz_zip_reader_file_stat(&zip, (mz_uint)file_index, &st) &&
+            !st.m_is_directory && st.m_is_supported &&
+            st.m_uncomp_size > 0 &&
+            st.m_uncomp_size <= (mz_uint64)out_max &&
+            st.m_uncomp_size <= 0x7FFFFFFFULL &&
+            mz_zip_reader_extract_to_mem(
+                &zip, (mz_uint)file_index, out_buf,
+                (size_t)st.m_uncomp_size, 0))
+        {
+                result = (int)st.m_uncomp_size;
+                if (out_filename && filename_max > 0)
+                {
+                        strncpy(out_filename, st.m_filename,
+                                (size_t)(filename_max - 1));
+                        out_filename[filename_max - 1] = '\0';
+                }
+        }
+
+        miniz_zip_close_reader(&reader, &zip);
+        return result;
+}
+
+typedef struct MinizZipPrefixSink
+{
+        unsigned char *dst;
+        int capacity;
+        int written;
+} MinizZipPrefixSink;
+
+static size_t miniz_zip_prefix_sink(void *opaque, mz_uint64 file_ofs,
+                                    const void *buf, size_t n)
+{
+        MinizZipPrefixSink *sink = (MinizZipPrefixSink *)opaque;
+
+        if (!sink || !buf)
+                return 0;
+
+        if (file_ofs < (mz_uint64)sink->capacity)
+        {
+                size_t avail = (size_t)sink->capacity - (size_t)file_ofs;
+                size_t copy = (n < avail) ? n : avail;
+                if (copy)
+                {
+                        memcpy(sink->dst + (size_t)file_ofs, buf, copy);
+                        if ((int)((size_t)file_ofs + copy) > sink->written)
+                                sink->written =
+                                    (int)((size_t)file_ofs + copy);
+                }
+        }
+        return n;
+}
+
+int MinizReadZipEntryPrefix(const char *path,
+                            unsigned int file_index,
+                            void *out_buf,
+                            int out_max)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_zip_archive_file_stat st;
+        MinizZipPrefixSink sink;
+        int result = -1;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+        if (!miniz_zip_open_reader(path, &reader, &zip))
+                return -1;
+
+        sink.dst = (unsigned char *)out_buf;
+        sink.capacity = out_max;
+        sink.written = 0;
+
+        if (file_index < mz_zip_reader_get_num_files(&zip) &&
+            mz_zip_reader_file_stat(&zip, (mz_uint)file_index, &st) &&
+            !st.m_is_directory && st.m_is_supported &&
+            st.m_uncomp_size > 0 &&
+            mz_zip_reader_extract_to_callback(
+                &zip, (mz_uint)file_index,
+                miniz_zip_prefix_sink, &sink, 0))
+            result = sink.written;
+
+        miniz_zip_close_reader(&reader, &zip);
+        return result;
+}
+
+/* AURORA_GBA_ZIP_STREAM_V1_20260910
+ * Streaming extract-to-file helpers. The old GBA ZIP/GZ launch path
+ * memalign()'d the full uncompressed ROM on the EE heap before writing
+ * the temp file; with gpSP's 16 MB ROM cache already carved out, 32 MB
+ * images died with "内存不足，无法解压GBA". These two functions
+ * decompress in small chunks directly into the destination file, so
+ * peak heap use is two fixed 32 KiB buffers instead of the ROM size. */
+
+typedef struct MinizFileSink
+{
+        FILE *fp;
+        long written;
+        int io_ok;
+} MinizFileSink;
+
+static size_t miniz_file_sink(void *opaque, mz_uint64 file_ofs,
+                              const void *buf, size_t n)
+{
+        MinizFileSink *sink = (MinizFileSink *)opaque;
+
+        (void)file_ofs;
+        if (!sink || !sink->io_ok || !buf || n == 0)
+                return 0;
+        if (fwrite(buf, 1, n, sink->fp) != n)
+        {
+                sink->io_ok = 0;
+                return 0;
+        }
+        sink->written += (long)n;
+        return n;
+}
+
+int MinizExtractZipEntryToFile(const char *path,
+                               unsigned int file_index,
+                               const char *out_path,
+                               char *out_filename,
+                               int filename_max)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_zip_archive_file_stat st;
+        MinizFileSink sink;
+        FILE *fp;
+        int result = -1;
+
+        if (!path || !out_path || !out_path[0])
+                return -1;
+        if (!miniz_zip_open_reader_pooled(path, &reader, &zip))
+                return -1;
+
+        if (file_index < mz_zip_reader_get_num_files(&zip) &&
+            mz_zip_reader_file_stat(&zip, (mz_uint)file_index, &st) &&
+            !st.m_is_directory && st.m_is_supported &&
+            st.m_uncomp_size > 0 &&
+            st.m_uncomp_size <= 0x7FFFFFFFULL)
+        {
+                remove(out_path);
+                fp = fopen(out_path, "wb");
+                if (fp)
+                {
+                        sink.fp = fp;
+                        sink.written = 0;
+                        sink.io_ok = 1;
+                        if (mz_zip_reader_extract_to_callback(
+                                    &zip, (mz_uint)file_index,
+                                    miniz_file_sink, &sink, 0) &&
+                            sink.io_ok &&
+                            fflush(fp) == 0 &&
+                            sink.written == (long)st.m_uncomp_size)
+                        {
+                                result = (int)st.m_uncomp_size;
+                                if (out_filename && filename_max > 0)
+                                {
+                                        strncpy(out_filename, st.m_filename,
+                                                (size_t)(filename_max - 1));
+                                        out_filename[filename_max - 1] = '\0';
+                                }
+                        }
+                        if (fclose(fp) != 0)
+                                result = -1;
+                        if (result < 0)
+                                remove(out_path);
+                }
+        }
+
+        miniz_zip_close_reader_pooled(&reader, &zip);
+        return result;
+}
+
+int MinizExtractZipEntryToSink(const char *path,
+                               unsigned int file_index,
+                               MinizSinkFn sink,
+                               void *opaque,
+                               char *out_filename,
+                               int filename_max)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_zip_archive_file_stat st;
+        MinizSinkCtx ctx;
+        int result = -1;
+
+        if (!path || !path[0] || !sink)
+                return -1;
+        if (!miniz_zip_open_reader_pooled(path, &reader, &zip))
+                return -1;
+
+        if (file_index < mz_zip_reader_get_num_files(&zip) &&
+            mz_zip_reader_file_stat(&zip, (mz_uint)file_index, &st) &&
+            !st.m_is_directory && st.m_is_supported &&
+            st.m_uncomp_size > 0 &&
+            st.m_uncomp_size <= 0x7FFFFFFFULL)
+        {
+                ctx.sink = sink;
+                ctx.opaque = opaque;
+                if (mz_zip_reader_extract_to_callback(
+                            &zip, (mz_uint)file_index,
+                            miniz_sink_trampoline, &ctx, 0))
+                {
+                        result = (int)st.m_uncomp_size;
+                        if (out_filename && filename_max > 0)
+                        {
+                                strncpy(out_filename, st.m_filename,
+                                        (size_t)(filename_max - 1));
+                                out_filename[filename_max - 1] = '\0';
+                        }
+                }
+        }
+
+        miniz_zip_close_reader_pooled(&reader, &zip);
+        return result;
+}
+
+int MinizReadZipEntryPrefixEarly(const char *path,
+                                 unsigned int file_index,
+                                 void *out_buf,
+                                 int out_max)
+{
+        MinizFileXioReader reader;
+        mz_zip_archive zip;
+        mz_zip_archive_file_stat st;
+        MinizZipPrefixOutCtx ctx;
+        int result = -1;
+
+        if (!out_buf || out_max <= 0)
+                return -1;
+        if (!miniz_zip_open_reader_pooled(path, &reader, &zip))
+                return -1;
+
+        ctx.dst = (unsigned char *)out_buf;
+        ctx.capacity = out_max;
+
+        if (file_index < mz_zip_reader_get_num_files(&zip) &&
+            mz_zip_reader_file_stat(&zip, (mz_uint)file_index, &st) &&
+            !st.m_is_directory && st.m_is_supported &&
+            st.m_uncomp_size >= (mz_uint64)out_max)
+        {
+                /* Return value ignored on purpose: the sink aborts the
+                   walk (short return) as soon as capacity bytes are out,
+                   which miniz reports as a callback failure. */
+                mz_zip_reader_extract_to_callback(
+                        &zip, (mz_uint)file_index,
+                        miniz_zip_prefix_out_sink, &ctx, 0);
+                result = out_max;
+        }
+
+        miniz_zip_close_reader_pooled(&reader, &zip);
+        return result;
+}
+
+/* AURORA_GBA_ARCHIVE_SINK_V1_20260911
+ * Streaming GZ core shared by the file extractor, the memory-cart sink
+ * extractor and the early-stop prefix probe. Mirrors miniz's own
+ * tinfl_decompress_mem_to_callback: a single 32 KiB ring-buffer
+ * dictionary (LZ77 back-references up to 32 KiB resolve inside it) plus a
+ * small input chunk - NOT the NON_WRAPPING_OUTPUT_BUF mode, which reads
+ * match history straight from the caller's linear output buffer that our
+ * write-and-reuse scheme cannot provide across calls.
+ * All working buffers are BSS statics: the memory-cart path runs AFTER
+ * gpSP's retro_init has claimed up to 16 MiB of heap for the ROM cache,
+ * where a 64 KiB heap malloc is not guaranteed. */
+static unsigned char s_GzInBuf[32 * 1024];
+static unsigned char s_GzDict[TINFL_LZ_DICT_SIZE];
+
+typedef struct MinizGzPrefixOutCtx
+{
+        unsigned char *dst;
+        int capacity;
+} MinizGzPrefixOutCtx;
+
+static size_t miniz_gz_prefix_out_sink(void *opaque,
+                                        unsigned long long file_ofs,
+                                        const void *buf,
+                                        size_t n)
+{
+        MinizGzPrefixOutCtx *ctx = (MinizGzPrefixOutCtx *)opaque;
+
+        if (!ctx || !buf || n == 0)
+                return 0;
+        if (file_ofs > (unsigned long long)ctx->capacity ||
+            n > (size_t)ctx->capacity - (size_t)file_ofs)
+                return 0;
+        memcpy(ctx->dst + (size_t)file_ofs, buf, n);
+        return n;
+}
+
+static int miniz_gz_stream_core(const char *path, MinizSinkFn sink,
+                                void *opaque, FILE *fp, int max_produce)
+{
+        tinfl_decompressor infl;
+        tinfl_status st;
+        unsigned char hdrbuf[4096];
+        int fd = -1;
+        int file_size, hdr, got, want, n;
+        long comp_end, fpos;
+        size_t in_len = 0, in_ofs = 0, dict_ofs = 0;
+        long long produced = 0;
+        int cap = (max_produce > 0) ? max_produce : 0;
+        int result = -1;
+
+        if (!path || !path[0] || (!sink && !fp))
+                return -1;
+
+        fd = fileXioOpen(path, FIO_O_RDONLY, 0);
+        if (fd < 0)
+                return -1;
+        file_size = fileXioLseek(fd, 0, FIO_SEEK_END);
+        if (file_size < 18 ||
+            fileXioLseek(fd, 0, FIO_SEEK_SET) < 0)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+
+        /* Parse the gzip header from the leading bytes (RFC 1952); the
+           deflate payload is [hdr .. file_size-8), the last 8 bytes
+           being CRC32+ISIZE which raw tinfl does not need. */
+        got = filexio_read_fully(fd, hdrbuf, (int)sizeof(hdrbuf));
+        hdr = (got >= 10)
+            ? parse_gzip_header(hdrbuf, got) : -1;
+        if (hdr < 0 || file_size <= hdr + 8)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+        comp_end = (long)file_size - 8;
+        if (fileXioLseek(fd, hdr, FIO_SEEK_SET) < 0)
+        {
+                fileXioClose(fd);
+                return -1;
+        }
+        fpos = hdr;
+
+        tinfl_init(&infl);
+        for (;;)
+        {
+                size_t in_avail, dst_capacity;
+
+                if (in_ofs == in_len)
+                {
+                        in_ofs = in_len = 0;
+                        if (fpos >= comp_end)
+                                break; /* NEEDS_MORE_INPUT with no input */
+                        want = (int)((comp_end - fpos) < (long)sizeof(s_GzInBuf)
+                                     ? (comp_end - fpos)
+                                     : (long)sizeof(s_GzInBuf));
+                        n = filexio_read_fully(fd, s_GzInBuf, want);
+                        if (n < want)
+                                break; /* truncated archive */
+                        in_len = (size_t)n;
+                        fpos += n;
+                }
+
+                in_avail = in_len - in_ofs;
+                dst_capacity = (size_t)(TINFL_LZ_DICT_SIZE - dict_ofs);
+                st = tinfl_decompress(
+                        &infl, s_GzInBuf + in_ofs, &in_avail,
+                        s_GzDict, s_GzDict + dict_ofs, &dst_capacity, 0);
+                in_ofs += in_avail;
+
+                if (dst_capacity)
+                {
+                        const unsigned char *chunk = s_GzDict + dict_ofs;
+                        size_t take = dst_capacity;
+
+                        if (cap > 0)
+                        {
+                                long long room =
+                                    (long long)cap - produced;
+                                if (room <= 0)
+                                        break; /* early stop: enough */
+                                if ((long long)take > room)
+                                        take = (size_t)room;
+                        }
+
+                        if (sink)
+                        {
+                                if (sink(opaque,
+                                         (unsigned long long)produced,
+                                         chunk, take) != take)
+                                        break;
+                        }
+                        else if (fwrite(chunk, 1, take, fp) != take)
+                                break;
+
+                        produced += (long long)take;
+
+                        if (cap > 0 && produced >= (long long)cap)
+                        {
+                                result = (int)produced;
+                                break;
+                        }
+                }
+
+                if (st != TINFL_STATUS_HAS_MORE_OUTPUT)
+                {
+                        if (sink)
+                        {
+                                if (st == TINFL_STATUS_DONE)
+                                        result = (int)produced;
+                        }
+                        else if (st == TINFL_STATUS_DONE &&
+                                 fflush(fp) == 0)
+                                result = (int)produced;
+                        break;
+                }
+                dict_ofs = (dict_ofs + dst_capacity)
+                         & (size_t)(TINFL_LZ_DICT_SIZE - 1);
+        }
+
+        fileXioClose(fd);
+        return result;
+}
+
+int MinizExtractGZToFile(const char *path, const char *out_path)
+{
+        FILE *fp;
+        int result;
+
+        if (!path || !path[0] || !out_path || !out_path[0])
+                return -1;
+
+        remove(out_path);
+        fp = fopen(out_path, "wb");
+        if (!fp)
+                return -1;
+
+        result = miniz_gz_stream_core(path, NULL, NULL, fp, 0);
+
+        if (fclose(fp) != 0)
+                result = -1;
+        if (result < 0)
+                remove(out_path);
+        return result;
+}
+
+int MinizExtractGZToSink(const char *path, MinizSinkFn sink, void *opaque)
+{
+        if (!path || !path[0] || !sink)
+                return -1;
+        return miniz_gz_stream_core(path, sink, opaque, NULL, 0);
+}
+
+int MinizReadGZPrefixStreaming(const char *path, void *out_buf, int out_max)
+{
+        MinizGzPrefixOutCtx ctx;
+
+        if (!path || !path[0] || !out_buf || out_max <= 0)
+                return -1;
+
+        ctx.dst = (unsigned char *)out_buf;
+        ctx.capacity = out_max;
+        return miniz_gz_stream_core(
+                path, miniz_gz_prefix_out_sink, &ctx, NULL, out_max);
+}

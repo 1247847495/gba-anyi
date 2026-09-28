@@ -1,0 +1,592 @@
+
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sifrpc.h>
+#include <loadfile.h>
+#include <elf-loader.h>
+#include <kernel.h>
+#include <iopcontrol.h>
+#include <sbv_patches.h>
+#define NEWLIB_PORT_AWARE
+#include <fileXio.h>
+#include <fileXio_rpc.h>
+#undef NEWLIB_PORT_AWARE
+#include <ps2_filesystem_driver.h>
+
+/* Memory-card stack is now loaded explicitly via the bin2c-embedded
+   sio2man / mcman / mcserv IRXs in embedded_irx.cpp instead of going
+   through ps2_drivers' init_memcard_driver(true).  See
+   MemCardLoadEmbeddedIrx() for the rationale. */
+#include "embedded_irx.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <libcdvd.h>
+#include <ps2sdkapi.h>
+
+#include "types.h"
+#include "console.h"
+#include "mainloop.h"
+#include "mainloop_smb.h" /* AURORA_RESET_SMB_V1_20260827 */
+
+extern "C" {
+#include "excepHandler.h"
+#include "cd.h"
+#include "hw.h"
+/* AURORA_BOOT_MARK_V1_20260912: defined in mainloop_ui.cpp; writes
+   _MainLoop_ModalStr only (no render, no modal count change) so the EE
+   exception screen's "Last marker:" line can name the boot phase that
+   was executing when the machine died. */
+void BootModalMark(const char *pFormat, ...);
+};
+
+/* USB is now brought up by UsbBdmLoadEmbeddedIrx() (see
+   embedded_irx.cpp): we embed a pinned BDM stack (FreeUsbd/usbd_mini +
+   bdm + bdmfs_fatfs + usbmass_bd) instead of inheriting whichever usbd
+   happens to be installed in the builder's PS2SDK.  Internal HDD support
+   stays on its separate lazy path. */
+
+/* DLog: writes to EE SIO TX FIFO (defined in modules/sjpcm/sjpcm_rpc.c).
+   Plain printf on the EE never reaches PCSX2/NetherSX2's emulator log
+   in this build, so the only way to surface boot-phase diagnostics is
+   via the EE SIO channel.  See sjpcm_rpc.c for the rationale. */
+extern "C" void DLog(const char *fmt, ...);
+
+/* The fileXio path ops table that libcglue routes fopen / opendir /
+   stat / mkdir to.  It is populated by __fileXioOpsInitializeImpl()
+   (which uses weak symbol probes to discover which newlib functions
+   are linked in) and the pointer is swapped into _libcglue_fdman_path_ops
+   by _ps2sdk_fileXio_init().
+
+   We declare and call both directly here because in this build the
+   pre-built libfileXio.a's automatic __attribute__((constructor)) for
+   __fileXioOpsInitializeImpl appears NOT to fire (or to fire with the
+   weak _open/_stat refs still resolving to 0), leaving the struct
+   entirely NULL.  When _ps2sdk_fileXio_init() then swaps the libcglue
+   pointer to point at it, every _libcglue_fdman_path_ops->open ==
+   NULL check in glue.c::_open / _stat / etc. trips and returns
+   ENOSYS=88.  Calling __fileXioOpsInitializeImpl() manually after the
+   IRX modules are up forces population from the now-fully-linked
+   newlib symbol table. */
+extern "C" _libcglue_fdman_path_ops_t __fileXio_fdman_path_ops;
+extern "C" void __fileXioOpsInitializeImpl(void);
+extern "C" void _ps2sdk_fileXio_init(void);
+
+
+
+/* Some launchers (and PCSX2's direct ELF loader in particular) are allowed
+   to enter main() without a useful argv[0].  The old code kept a NULL
+   pointer in that case and immediately passed it to strcpy(), crashing
+   before video or the boot log existed.  Keep owned, always-valid buffers
+   instead of retaining the launcher's pointer. */
+static char  _Main_BootPath[256] = "host:";
+static char *_Main_pBootPath     = _Main_BootPath;
+static char  _Main_BootDir[256]  = "host:";
+
+
+char *MainGetBootDir()
+{
+	return _Main_BootDir;
+}
+
+char *MainGetBootPath()
+{
+	return _Main_pBootPath;
+}
+
+void MainSetBootDir(const char *pPath)
+{
+	size_t len;
+	size_t keep = 0;
+	size_t i;
+
+	if (!pPath || !pPath[0])
+		pPath = "host:";
+
+	strncpy(_Main_BootDir, pPath, sizeof(_Main_BootDir) - 1);
+	_Main_BootDir[sizeof(_Main_BootDir) - 1] = 0;
+	len = strlen(_Main_BootDir);
+
+	/* Keep everything through the final device/path separator.  A launcher
+	   that only supplies "SNESticle_Aurora.elf" gives us no directory information;
+	   host: is the only safe fallback and is also what ps2link/PCSX2 expose
+	   for a directly loaded ELF. */
+	for (i = len; i > 0; i--)
+	{
+		char c = _Main_BootDir[i - 1];
+		if (c == '/' || c == '\\' || c == ':')
+		{
+			keep = i;
+			break;
+		}
+	}
+
+	if (keep == 0)
+	{
+		strcpy(_Main_BootDir, "host:");
+	}
+	else
+	{
+		_Main_BootDir[keep] = 0;
+	}
+}
+
+/* AURORA_RESET_SMB_V1_20260827
+ *
+ * A launcher-provided smb0:/smb1: path names the launcher's SMB mount.
+ * Aurora resets the IOP during startup, so that mount no longer exists when
+ * "Reset emulator" is selected later.
+ *
+ * Aurora's own ps2smb stack exposes the connected share as "smb:". Reconnect
+ * it first, then preserve only the path portion after the old device prefix.
+ */
+static int MainPrepareResetBootPath(const char *bootPath,
+                                    char *resolvedPath,
+                                    size_t resolvedPathSize)
+{
+    const char *suffix = NULL;
+
+    if (!bootPath || !bootPath[0] || !resolvedPath || resolvedPathSize == 0)
+        return 0;
+
+    if (!strncmp(bootPath, "smb:", 4) ||
+        !strncmp(bootPath, "SMB:", 4))
+    {
+        suffix = bootPath + 4;
+    }
+    else if (!strncmp(bootPath, "smb0:", 5) ||
+             !strncmp(bootPath, "SMB0:", 5) ||
+             !strncmp(bootPath, "smb1:", 5) ||
+             !strncmp(bootPath, "SMB1:", 5))
+    {
+        suffix = bootPath + 5;
+    }
+
+    if (!suffix)
+    {
+        if (strlen(bootPath) >= resolvedPathSize)
+            return 0;
+        strcpy(resolvedPath, bootPath);
+        return 1;
+    }
+
+    DLog("[reset] SMB boot detected: %s", bootPath);
+    DLog("[reset] reconnecting Aurora SMB mount");
+
+    /* AURORA_FCEUMM_FDS_V5_CI_SMB_UPSTREAM_PERF_20260827
+     * SMB support defaults OFF. V1 called SmbEnsureMounted() directly, which
+     * therefore returned -1 before loading SMB.CNF or touching the network.
+     * A reset of an SMB-launched ELF is itself an explicit request to use SMB:
+     * enable the feature and force a fresh share/auth session rather than
+     * trusting a stale s_mounted flag. */
+    SmbSupportSetEnabled(1);
+    SmbDisconnect();
+
+    if (SmbEnsureMounted() < 0)
+    {
+        DLog("[reset] SMB reconnect failed: error=%d status=%s",
+             SmbGetLastError(), SmbGetStatusText());
+        return 0;
+    }
+
+    if (snprintf(resolvedPath, resolvedPathSize,
+                 "smb:%s", suffix) >= (int)resolvedPathSize)
+    {
+        DLog("[reset] normalized SMB boot path is too long");
+        return 0;
+    }
+
+    DLog("[reset] SMB reconnect OK via %s; normalized path: %s",
+         SmbGetConfigPath()[0] ? SmbGetConfigPath() : "(unknown config)",
+         resolvedPath);
+    return 1; /* AURORA_FCEUMM_FDS_V5_CI_SMB_UPSTREAM_PERF_20260827 */
+}
+
+void MainResetEmulator(void)
+{
+    const char *pBootPath = MainGetBootPath();
+    char resolvedBootPath[256];
+    int ret;
+
+    if (!pBootPath || !pBootPath[0])
+        return;
+
+    if (!MainPrepareResetBootPath(
+            pBootPath, resolvedBootPath, sizeof(resolvedBootPath)))
+    {
+        DLog("[reset] could not prepare boot path: %s", pBootPath);
+        return;
+    }
+
+    /*
+     * Do not use LoadExecPS2 here. It goes through EELOAD and resets
+     * the IOP before loading the target, losing non-ROM filesystem
+     * drivers such as USB/BDM/SMB.
+     *
+     * PS2SDK's elf-loader first installs a small loader below 0x00100000.
+     * The current filesystem stack remains alive until the target ELF has
+     * been loaded into EE RAM.
+     */
+    DLog("[reset] reloading ELF: %s", resolvedBootPath);
+
+    ret = LoadELFFromFile(resolvedBootPath, 0, NULL);
+
+    /* Success transfers execution and never normally gets here. */
+    DLog("[reset] LoadELFFromFile failed: %d (%s)",
+         ret, resolvedBootPath);
+}
+
+/* AURORA_EE_INIT_ARRAY_V1_20260909
+ *
+ * PS2SDK's EE CRT never walks .init_array: the toolchain's legacy
+ * __do_global_ctors_aux only scans the .ctors output section, which the
+ * default linker script fills with nothing but crtbegin's -1 sentinel.
+ * Every real C++ global constructor pointer therefore never ran --
+ * including Gambatte's `static gambatte::GB gb` (libretro.o),
+ * libstdc++'s eh_alloc/eh_globals/eh_terminate/new_handler and ps2sdk's
+ * own fileXio/libcglue ops (see the .init_array block in
+ * build/anyi-gba.map). With gb unconstructed, gb.p_ stayed NULL and the
+ * first core call dereferenced NULL+offset -> TLB exception
+ * (BadVAddr 0x1320 = NULL + offsetof(Priv, cartridge)), which is what
+ * crashed GB/GBC at the DBG[GB11] marker.
+ *
+ * The default linker script PROVIDEs __init_array_start/__init_array_end;
+ * referencing them here makes the linker define them, and we run every
+ * entry once from main() before anything can touch a global C++ object.
+ * The manual __fileXioOpsInitializeImpl() call further down stays: it
+ * re-populates the same struct idempotently. All ps2sdk ctors in the
+ * array only fill function-pointer tables (no RPC), so running them
+ * here is safe. */
+typedef void (*MainGlobalCtorFn)(void);
+extern "C" {
+extern MainGlobalCtorFn __init_array_start[];
+extern MainGlobalCtorFn __init_array_end[];
+}
+
+static void MainRunGlobalCtors(void)
+{
+	MainGlobalCtorFn *pFn;
+	int iCtor = 0;
+	/* AURORA_BOOT_MARK_V1_20260912: paint the ctor's address BEFORE
+	   calling it, so a crash inside entry i shows "ctorN:<addr>" as the
+	   last marker and the .map file names the object immediately. */
+	for (pFn = __init_array_start; pFn < __init_array_end; pFn++, iCtor++)
+		if (*pFn)
+		{
+			BootModalMark("ctor%d:%p", iCtor, (void *)*pFn);
+			(*pFn)();
+		}
+}
+
+/* Your program's main entry point */
+int main(int argc, char **argv) 
+{
+    int iArg;
+
+	if (argc > 0 && argv && argv[0] && argv[0][0])
+	{
+		strncpy(_Main_BootPath, argv[0], sizeof(_Main_BootPath) - 1);
+		_Main_BootPath[sizeof(_Main_BootPath) - 1] = 0;
+	}
+
+	MainSetBootDir(_Main_pBootPath);
+
+	DLog("[boot] main: argc=%d path='%s' dir='%s'",
+	     argc, _Main_pBootPath, _Main_BootDir);
+
+	SifInitRpc(0);
+	DLog("[boot] SifInitRpc done");
+
+	/* AURORA_EE_EXCEPTION_SCREEN_V1_20260906
+	   Install EE level-1 exception handlers (excepHandler.s/.c) as early as
+	   possible. On real hardware a fault (TLB miss / address error / bus error /
+	   reserved instruction) just halts the CPU on a frozen framebuffer, while
+	   PCSX2 tolerates several of those faults -- which is exactly why some
+	   freezes never reproduce under emulation. If the machine dies while a
+	   marker is on screen, the handler repaints Cause/BadVAddr/EPC plus the
+	   last modal marker instead of dying silently. */
+	installExceptionHandlers();
+	DLog("[boot] exception handlers installed");
+	BootModalMark("boot:handlers");
+
+	/* AURORA_EE_INIT_ARRAY_V1_20260909: run every .init_array entry now
+	   (see the comment above MainRunGlobalCtors for why nothing else ever
+	   did). Kept after installExceptionHandlers() so a ctor crash still
+	   gets the on-screen exception dump. */
+	MainRunGlobalCtors();
+	/* AURORA_BOOT_MARK_V1_20260912: heap sanity probe right after the ctor
+	   chain (ctors 0..9 already painted "ctorN:<addr>" markers).  A garbage
+	   pointer here names heap corruption as the boot killer; anything close
+	   to _end (image end) means the heap came up clean. */
+	{
+		char *pProbe = new char[16];
+		BootModalMark("ctors done heap=%p", (void *)pProbe);
+		delete[] pProbe;
+	}
+	DLog("[boot] global ctors done (%d)",
+	     (int)(__init_array_end - __init_array_start));
+
+	/* Reset the IOP so the BIOS-resident modules (sceCdvdfsv, sceSio2man,
+	   sceMcMan, sceMcServ, etc.) are unloaded before ps2_drivers tries
+	   to install its own modern copies.  Without this reset the two
+	   sets of IRX modules end up half-overlapping in RPC tables and the
+	   tail of init_ps2_filesystem_driver() - specifically the mcman /
+	   poweroff hand-off - hangs silently after dev9 init prints its
+	   banner.  This is exactly the sequence picodrive's plat.c follows
+	   in platform/ps2/plat.c::reset_IOP.
+
+	   This is the one and only reset for every boot device.  The old
+	   memory-card path reset the IOP a second time after loading all drivers,
+	   erased their RPC servers, and retained stale EE "loaded" flags.  That
+	   sequence was especially fragile on Deckard-based slim consoles. */
+	DLog("[boot] SifIopReset: enter");
+	while (!SifIopReset("", 0)) {}
+	while (!SifIopSync()) {}
+	SifInitRpc(0);
+	SifLoadFileInit();
+	FlushCache(0);
+	EmbeddedIrxResetRuntimeState();
+	DLog("[boot] SifIopReset done");
+	BootModalMark("boot:iopreset");
+
+	/* Patch the rom0:LOADFILE service so SifExecModuleBuffer (used by
+	   our embedded-IRX loader in src/platform/ps2/system/embedded_irx.cpp)
+	   and ps2_drivers' init_ps2_filesystem_driver actually work. The
+	   stock retail BIOS LOADFILE module is missing LoadModuleBuffer
+	   support, so without these patches the EE call "succeeds" but the
+	   IRX never finishes registering its RPC server. The prefix check
+	   patch additionally lets us load modules from any device, which
+	   is useful for cdrom: / host: fallbacks.
+
+	   These patches must run after SifIopReset because the reset
+	   reloads rom0:LOADFILE in its pristine, unpatched state. */
+	sbv_patch_enable_lmb();
+	sbv_patch_disable_prefix_check();
+	DLog("[boot] sbv patches applied");
+	BootModalMark("boot:sbv");
+
+	/* Bring up the modern PS2DEV filesystem stack: iomanX, fileXio,
+	   poweroff, mcman/mcserv, cdfs, usb.  Once this is done, newlib
+	   stdio (fopen/fread/fwrite/fclose/mkdir/opendir) routes through
+	   iomanX, so paths like "mc0:/GBAticle/<rom>.srm",
+	   "cdfs:/ROMS/foo.sfc", "mass:/bar/baz" all work as standard POSIX
+	   file paths from the EE side.
+
+	   The legacy rom0:FILEIO RPC was the original I/O path in this
+	   codebase (fioOpen / fioDopen / fioRead).  It silently dropped a
+	   non-trivial fraction of memcard reads on emulators (the SRAM
+	   load bug that motivated this refactor), so we switch the whole
+	   EE side over to fileXio.  The fio* API stays available for callers
+	   that still need it - fileXio's iomanX-based device list is a
+	   superset of the legacy fileio one.
+
+	   We deliberately do NOT call the all-in-one
+	   init_ps2_filesystem_driver() that ps2_drivers ships.  That
+	   helper also calls init_dev9_driver(), init_hdd_driver(),
+	   mount_current_hdd_partition() and waitUntilDeviceIsReady(cwd) at
+	   the end, all of which we don't need (SNESticle never touches the
+	   PS2 HDD or DEV9 hardware) and at least one of which hangs
+	   silently after dev9 prints "unknown dev9 hardware" on emulators
+	   and most retail PS2s.  Inlining the bring-up here lets us bracket
+	   every step with a DLog so the next hang, if any, can be pinpointed
+	   directly from the EE_SIO emulator log. */
+	DLog("[boot] init_poweroff_driver: enter");
+	init_poweroff_driver();
+	DLog("[boot] init_poweroff_driver: done");
+	BootModalMark("boot:poweroff");
+
+	DLog("[boot] init_fileXio_driver: enter");
+	init_fileXio_driver();
+	DLog("[boot] init_fileXio_driver: done");
+	BootModalMark("boot:filexio");
+
+	/* Route newlib stdio (fopen / opendir / stat / mkdir / ...) through
+	   fileXio -> iomanX instead of the legacy fio backend.  Must come
+	   after init_fileXio_driver() (which loads fileXio.irx + iomanX.irx
+	   on the IOP) and before any fopen / opendir on a cdfs: / mc0: /
+	   mass: / host: path.
+
+	   Order matters:
+	   1) __fileXioOpsInitializeImpl() populates __fileXio_fdman_path_ops
+	      with the fileXio*Helper trampolines (open, stat, dread, ...).
+	      This MUST run from the EE main, not from libfileXio's static
+	      constructor - the constructor fires before our newlib glue is
+	      fully linked and the weak _open / _stat refs resolve to 0,
+	      leaving the struct NULL.
+	   2) _ps2sdk_fileXio_init() swaps _libcglue_fdman_path_ops to point
+	      at __fileXio_fdman_path_ops so newlib stdio uses the fileXio
+	      backend. */
+	DLog("[fxglue] before init: open=%p stat=%p",
+	     (void *)__fileXio_fdman_path_ops.open,
+	     (void *)__fileXio_fdman_path_ops.stat);
+	__fileXioOpsInitializeImpl();
+	DLog("[fxglue] after init:  open=%p stat=%p mkdir=%p",
+	     (void *)__fileXio_fdman_path_ops.open,
+	     (void *)__fileXio_fdman_path_ops.stat,
+	     (void *)__fileXio_fdman_path_ops.mkdir);
+	DLog("[fxglue] before swap: _libcglue_fdman_path_ops=%p",
+	     (void *)_libcglue_fdman_path_ops);
+	_ps2sdk_fileXio_init();
+	DLog("[fxglue] after swap:  _libcglue_fdman_path_ops=%p (==fx %p)",
+	     (void *)_libcglue_fdman_path_ops,
+	     (void *)&__fileXio_fdman_path_ops);
+	BootModalMark("boot:fxglue");
+
+	/* Memory-card IRX stack (sio2man + mcman + mcserv) is now loaded
+	   from the buffers embedded in this ELF rather than from
+	   ps2_drivers' init_memcard_driver(true), which embeds the same
+	   three IRXs in libps2_drivers.a.  Doing the load explicitly here
+	   pins the IRX versions to whatever the in-tree PS2SDK supplies,
+	   makes the load order visible in source, and matches the pattern
+	   used by picodrive / OPL / hugorsgarcia/PS2SNESticle. */
+	DLog("[boot] MemCardLoadEmbeddedIrx: enter");
+	{
+		int mcret = MemCardLoadEmbeddedIrx();
+		DLog("[boot] MemCardLoadEmbeddedIrx: done (ret=%d)", mcret);
+		(void)mcret;
+	}
+	BootModalMark("boot:mc");
+
+	DLog("[boot] UsbBdmLoadEmbeddedIrx: enter");
+	/* USB via stack BDM fixada (FreeUsbd mini + FAT/exFAT/MBR/GPT),
+	   no lugar do init_usb_driver() do ps2_drivers.  Nao usa dev9, entao
+	   nao corre o risco de travar boot do HD interno. */
+	UsbBdmLoadEmbeddedIrx();
+	DLog("[boot] UsbBdmLoadEmbeddedIrx: done");
+	BootModalMark("boot:usb");
+
+	DLog("[boot] CdfsLoadEmbeddedIrx: enter");
+	{
+		int cdfsret = CdfsLoadEmbeddedIrx();
+		DLog("[boot] CdfsLoadEmbeddedIrx: done (ret=%d)", cdfsret);
+		(void)cdfsret;
+	}
+	BootModalMark("boot:cdfs");
+
+	/* Inicia o cdvd SEM checar disco (SCECdINoD), nao SCECdINIT.  No boot
+	   por DISCO num PS2 real, o drive ainda esta assentando/girando e o
+	   SCECdINIT (que espera o disco) pode TRAVAR -> tela preta (so' no
+	   hardware; no emulador o drive ja' esta pronto).  SCECdINoD inicia o
+	   subsistema sem o check, evitando o lockup -- mesma defesa do
+	   wLaunchELF (loadCdModules).  O tipo do disco e' consultado depois,
+	   quando o browser entra em cdfs: (drive ja' pronto). */
+	DLog("[boot] sceCdInit(INoD): enter");
+	sceCdInit(SCECdINoD);
+	DLog("[boot] sceCdInit(INoD): done (diskType=%d)", sceCdGetDiskType());
+	BootModalMark("boot:cdvd");
+
+	/* Probes de boot DESATIVADOS (#if 0): faziam opendir/stat/fileXioDopen
+	   em cdfs: durante a inicializacao (codigo de debug -- os DLog ja'
+	   estavam comentados).  Num PS2 real bootando por disco isso tocava o
+	   drive cedo demais (antes de pronto) e podia travar/atrasar o boot.
+	   O browser le o cdfs: so' quando o usuario entra nele (drive pronto). */
+#if 0
+	/* Runtime FS probe: log opendir/stat for every top-level mount so
+	   the next boot tells us exactly where the browser breaks. The
+	   browser uses printf which never reaches the SIO log; this dup
+	   via DLog does. */
+	// DLog("[probe] fs probe begin");
+	{
+		const char *paths[] = { "cdfs:/", "cdfs:", "mc0:/", "mc0:", "mass:/", "host:/" };
+		int i;
+		for (i = 0; i < (int)(sizeof(paths) / sizeof(paths[0])); i++) {
+			DIR *d; struct stat st; int rc;
+			errno = 0; rc = stat(paths[i], &st);
+			// DLog("[probe] stat('%s') -> %d (errno=%d, mode=0%o)",
+			//      paths[i], rc, errno, rc == 0 ? (unsigned)st.st_mode : 0);
+			(void)rc;
+			errno = 0; d = opendir(paths[i]);
+			// DLog("[probe] opendir('%s') -> %p (errno=%d)", paths[i], (void *)d, errno);
+			if (d) {
+				struct dirent *de; int n = 0;
+				while ((de = readdir(d)) != NULL && n < 8) {
+					/* DLog("[probe]   readdir[%d] = '%s'", n, de->d_name); */ n++;
+				}
+				// DLog("[probe]   total entries listed = %d", n);
+				closedir(d);
+			}
+		}
+	}
+	// DLog("[probe] fs probe end");
+
+	/* Direct fileXio probe: bypass newlib entirely. If these work
+	   where opendir() above does not, the EE newlib<->iomanX glue
+	   is the issue and the browser should call fileXio* directly. */
+	// DLog("[fxprobe] direct fileXio probe begin");
+	{
+		const char *paths[] = { "cdfs:/", "cdfs:", "mc0:/", "mass:/", "host:/" };
+		int i;
+		iox_dirent_t de;
+		iox_stat_t st;
+		for (i = 0; i < (int)(sizeof(paths) / sizeof(paths[0])); i++) {
+			int sr = fileXioGetStat(paths[i], &st);
+			// DLog("[fxprobe] fileXioGetStat('%s') -> %d (mode=0x%x)",
+			//      paths[i], sr, sr == 0 ? (unsigned)st.mode : 0);
+			(void)sr;
+			int d = fileXioDopen(paths[i]);
+			// DLog("[fxprobe] fileXioDopen('%s') -> %d", paths[i], d);
+			if (d >= 0) {
+				int n = 0;
+				while (fileXioDread(d, &de) > 0 && n < 8) {
+					// DLog("[fxprobe]   dread[%d] = '%s' (mode=0x%x)", n, de.name, (unsigned)de.stat.mode);
+					n++;
+				}
+				// DLog("[fxprobe]   total entries listed = %d", n);
+				fileXioDclose(d);
+			}
+		}
+	}
+	// DLog("[fxprobe] direct fileXio probe end");
+#endif
+
+	/* cdvdInit(CDVD_INIT_NOWAIT) used to live here.  It is intentionally
+	   gone now: it binds to RPC 0x80000592 (CDVD_INIT_BIND_RPC, see
+	   src/platform/ps2/cdvd/cd.c) which was served by the iaddis-era
+	   custom CDVD.IRX.  That IRX is no longer loaded - the modern
+	   the embedded streaming cdfs.irx instead exposes
+	   cdfs: through iomanX and registers a different RPC number.  With
+	   no server bound to 0x80000592, cdvdInit's SifBindRpc spin loop
+	   never completes and the EE hangs silently (black screen, no
+	   further IOP output) before MainLoopInit even gets a chance to
+	   run.  All disc I/O now goes through fopen("cdfs:/...") via the
+	   refactor in src/platform/ps2/system/mainloop_load.cpp etc. */
+
+    for (iArg=0; iArg < argc; iArg++)
+    {
+        DLog("[boot] argv[%d] = %s", iArg,
+             (argv && argv[iArg]) ? argv[iArg] : "(null)");
+    }
+
+	DmaReset();
+	DLog("[boot] DmaReset done");
+	BootModalMark("boot:dma");
+
+    install_VRstart_handler();
+    DLog("[boot] install_VRstart_handler done");
+    BootModalMark("boot:vrstart");
+
+	ConInit();
+	DLog("[boot] ConInit done -> MainLoopInit");
+	BootModalMark("boot:video");
+
+	if (MainLoopInit())
+	{
+		DLog("[boot] MainLoopInit OK -> entering MainLoopProcess loop");
+		BootModalMark("ml:init ok");
+		while (MainLoopProcess())
+		{
+		}
+
+		MainLoopShutdown();
+	}
+	else
+	{
+		DLog("[boot] MainLoopInit FAILED");
+	}
+
+	ConShutdown();
+
+	return 0;
+}

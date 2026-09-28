@@ -1,0 +1,122 @@
+#include <stdlib.h>
+#include <string.h>
+#include <kernel.h>
+#include <libpad.h>
+#include "types.h"
+#if 0
+#include "font.h"
+#else
+#include "font.h"
+#endif
+#include "poly.h"
+#include "uiLog.h"
+
+
+CLogScreen::CLogScreen()
+{
+	m_nMessages = 0;
+	m_iScroll = 0;
+	m_nDisplayLines = 16;
+	/*
+	AddMessage("Test");
+	AddMessage("Test2");
+	AddMessage("Boo");
+	AddMessage("Crap");
+	*/
+}
+
+void CLogScreen::AddMessage(const char *pStr)
+{
+	/* AURORA_RUNTIME_SAFE_LOG_STRINGS_V1_4_2 */
+	if (m_nMessages < UILOG_NUMMESSAGES)
+	{
+		if (!pStr)
+			pStr = "";
+		strncpy(m_Messages[m_nMessages], pStr, UILOG_MESSAGECHARS - 1);
+		m_Messages[m_nMessages][UILOG_MESSAGECHARS - 1] = '\0';
+		m_nMessages++;
+		m_iScroll = m_nMessages - m_nDisplayLines;
+	}
+}
+
+static void _MenuPrintAlignCenter(int x, int y, const char *str, Bool bHighlight = FALSE)
+{                
+    x-= FontGetStrWidth(str) / 2;
+    FontPuts(x, y, str);
+
+    if (bHighlight)
+    {
+		PolyColor4f(0.0f, 1.0f, 0.0f, 0.5f); 
+		PolyRect(x-1, y-1, FontGetStrWidth(str) + 2, FontGetHeight() + 2);
+    }
+}
+
+static void _MenuHeader(int vy, const char *str)
+{
+    PolyColor4f(0.0f, 0.2f, 0.2f, 0.5f); 
+	PolyRect(32, vy, 256-64, 9);
+	FontColor4f(0.0, 0.8f, 0.8f, 1.0f);
+    _MenuPrintAlignCenter(128, vy, str);
+}
+
+void CLogScreen::Draw()
+{
+	Int32 iMsg;
+	Int32 nLines;
+	Int32 vx=128, vy = 20;
+
+	FontSelect(0);
+	FontColor4f(0.0, 0.8f, 0.8f, 1.0f);
+
+	vx = 10;
+	_MenuHeader(vy, "消息日志");
+	vy+=FontGetHeight() * 2;
+
+	FontColor4f(1.0f, 1.0f, 1.0f, 1.0f);   // -> amber via FontColor4f remap
+
+	if (m_iScroll >= (m_nMessages - m_nDisplayLines))
+		m_iScroll = (m_nMessages - m_nDisplayLines);
+	if (m_iScroll < 0) m_iScroll = 0;
+		
+
+	nLines = m_nDisplayLines;
+	iMsg = m_iScroll;
+	while (nLines > 0)
+	{
+		if (iMsg >= 0 && iMsg < m_nMessages)
+		{
+			Char *pStr = m_Messages[iMsg]; 
+			if (pStr)
+			{
+				FontPuts(vx, vy, pStr);
+			}
+		}
+
+		vy += FontGetHeight() + 2;
+		iMsg++;
+		nLines--;
+	}
+
+	_MenuHeader(vy, "");
+}
+
+void CLogScreen::Process()
+{
+}
+
+void CLogScreen::Input(Uint32 buttons, Uint32 trigger)
+{
+    if (trigger & PAD_UP)
+	{
+		m_iScroll--;
+	}
+
+    if (trigger & PAD_DOWN)
+	{
+		m_iScroll++;
+	}
+}
+
+
+
+
