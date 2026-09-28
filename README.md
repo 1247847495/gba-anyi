@@ -1,120 +1,71 @@
-# SNESticle Aurora — In development
+# GBA模拟器anyi汉化版（gba-anyi）
 
-**SNESticle Aurora** is a PlayStation 2 emulator fork maintained by **@itsveenee**, focused on 240p CRT output, real PS2 hardware, accuracy and compatibility improvements, and other hardware-specific or experimental ideas.
+**PlayStation 2 实机专用的 Game Boy 系列模拟器 —— 支持 GB / GBC / GBA。**
 
-SNESticle Aurora is based on **SNESticle Revive by @ReyFxck (Thomas R.)**, whose work brought SNESticle back into active development, and ultimately on the original **SNESticle by Icer Addis**. Huge thanks to @ReyFxck for his work on SNESticle Revive and for providing the foundation from which Aurora was created and Icer Addis for creating the original SNESticle and its codebase.
+| 支持平台 | 模拟核心 |
+| --- | --- |
+| Game Boy（GB） | Gambatte |
+| Game Boy Color（GBC） | Gambatte |
+| Game Boy Advance（GBA） | gpSP |
 
-<!-- AURORA_CORE_NOTICES_V6_20260824 -->
-NES emulation through **QuickNES** and **FCEUmm** (for Disk System only) is based on: the **QuickNES core originally by Shay Green**, with the libretro core maintained by **libretro contributors**, using `itsveenee/QuickNES_Core` as a pinned Git submodule for its PS2 integration (see [THIRD_PARTY.md](THIRD_PARTY.md) and `LICENSES/QuickNES-GPL-2.0.txt`); **FCEUmm**, using the pinned `itsveenee/Fceumm-PS2` Git submodule at `src/third_party/fceumm-fds` (FDS firmware is **not included**: users must provide `disksys.rom` in `SNESticle/SYSTEM`) (see [THIRD_PARTY.md](THIRD_PARTY.md) and `LICENSES/FCEUmm-GPL-2.0.txt`).
+anyi-gba（anyi 汉化版）基于 **SNESticle Aurora** 深度定制汉化而来：全界面简体中文，并针对 PS2 真机硬件做了大量专有性能优化。
 
-Mega Drive, Master System, Game Gear, 32X and Sega CD emulation through **PicoDrive** is based on the emulator originally by **notaz**, with current PicoDrive/libretro work by **irixxxx and other contributors**. Sega CD is exposed experimentally through path-only `.cue` loading; users provide a matching regional BIOS in `SNESticle/SYSTEM`. See [THIRD_PARTY.md](THIRD_PARTY.md) and `LICENSES/PicoDrive-COPYING.txt`.
+当前版本：**anyi-gba v1.02 测试版**
 
-PC Engine / TurboGrafx-16 emulation through **Beetle PC Engine Fast** is based on the libretro port/fork of **Mednafen PCE Fast**, maintained by libretro and Mednafen contributors. Aurora uses `itsveenee/beetle-pce-fast-libretro` with PS2-specific integration and optimization. HuCard (`.pce`, including ZIP/GZ paths) and experimental PC Engine CD `.cue` loading are exposed; CD firmware is user-supplied in `SNESticle/SYSTEM`. See [THIRD_PARTY.md](THIRD_PARTY.md) and `LICENSES/Beetle-PCE-Fast-GPL-2.0.txt`.
+## 功能特性
 
-There is currently an **experimental, NON-WORKING build** of **Snes9x 2010**, based on Snes9x and its libretro core contributors, from the pinned `itsveenee/snes9x2010` submodule. Its license is separate from Aurora's GPL-covered code and is mirrored at `LICENSES/Snes9x2010-LICENSE.txt`; preserve and review those terms before redistribution.
+### 模拟核心
 
-<!-- AURORA_FCEUMM_FDS_CHECKPOINT_V1 -->
-<!-- AURORA_FCEUMM_FDS_DOCS_V8_1_20260827 -->
+- **GBA —— gpSP 核心**
+  - ≤16MB ROM：JIT 动态翻译执行，保持满速运行
+  - \>16MB ROM（32MB 超大游戏）：启动时自动切换解释器模式，确保稳定
+  - 32MB 游戏专属加速：ReGBA 式纯轮换（round-robin）页面置换 + IOP 协处理器异步预取（64KB 块，顺序流检测自动加大预读量，不阻塞模拟主线程）
+  - GBA ROM 启动时只预读前 4MB，其余数据按需换页载入，缩短进入游戏时间
+- **GB / GBC —— Gambatte 核心**
 
+### 存档系统
 
-SNESticle Aurora code covered by the GPL remains under GNU GPLv2; separately licensed third-party components remain under their own terms. **Code license and project branding are separate.** The applicable software licenses grant rights in the code; they **do not grant permission to use the SNESticle Aurora name** or the project-specific **Aurora** identity/branding for an unofficial fork, modified build, redistributed binary, or derivative project. Unless separately authorized by **@itsveenee**, use a distinct project/product name and distinct branding. Factual attribution such as “based on SNESticle Aurora” remains welcome. See [BRANDING.md](BRANDING.md).
+- 电池存档（SRAM，`.srm`）自动保存
+- 即时存档 / 读档：支持快捷键（L2 + ×）与菜单操作两种方式，即时存档文件使用 `a` 后缀（如 `游戏名.a1a`）
+- ROM CRC 校验，防止跨游戏误读存档
 
-Project lineage and attribution are documented in [CREDITS.md](CREDITS.md). See LICENSE, [BRANDING.md](BRANDING.md), and the third-party license files for licensing details.
+### ROM 支持
 
-Keep in mind: this project uses **AI-generated code**, but the changes are tested by me, and I'm a Human according to reCAPTCHA.
+- 直接运行 `.gba` / `.gb` / `.gbc`，以及 ZIP / GZ 压缩包（流式解压，无需事先解包）：
+  - ≤16MB 压缩游戏：32KB 块流式解压直接载入 ROM 缓存，不产生临时文件
+  - \>16MB 压缩游戏：64KB 前缀解压 + 与压缩包同设备的缓存文件，退出游戏时自动清理
 
+### 存储与网络
 
-## Building from Git
+- 支持记忆卡（MC）、USB、内置 HDD、MX4SIO 与 SMB 网络共享
+- SMB 连接可在软件内直接配置 PS2 本机 IP、子网掩码、网关（参考 `SMB.CNF.example`）
 
-Clone SNESticle Aurora together with its pinned third-party cores:
+### 界面（全简体中文）
+
+- 菜单与系统消息全部简体中文
+- ROM 文件名 GBK 编码自动转换为 UTF-8 显示（不改动文件本体，读写不受影响）
+- 设置菜单分页管理：**画面 / 音频 / 性能 / 手柄按键 / 存储**
+  - 240p CRT 视频输出与画面调整选项
+  - **手柄按键自定义**：叉 / 圈 / 三角 / 方块可自由映射为 GBA 的 A / B / X / Y（配置保存至记忆卡，仅对游戏内生效）
+
+## 从源码构建
+
+本仓库已完整内置全部源码（含各模拟核心，无需下载任何子模块）。构建需要 [PS2Dev](https://github.com/ps2dev) 工具链（ps2sdk）：
 
 ```bash
-git clone --recurse-submodules https://github.com/itsveenee/SNESticleAurora.git
-cd SNESticleAurora
-git submodule update --init --recursive
-make
+git clone https://github.com/1247847495/gba-anyi.git
+cd gba-anyi
+make                # 首次构建可使用: make AUTO_INSTALL=yes 自动安装工具链
 ```
 
-If the repository was cloned without `--recurse-submodules`, run
-`git submodule update --init --recursive` afterwards.
+构建产物位于 `build/` 目录（`anyi-gba*.elf`）。将 ELF 复制到记忆卡、U 盘等设备，通过 wLaunchELF 等启动器即可运行。
 
+## 版权与致谢
 
-## What's new?
-
-**FEATURES ADDED:**
-
-Emulation:
-
-* NES emulation with QuickNES, Famicom Disk System through FCEUmm (no firmware included)
-* Support added for more NES mappers: 13, 16, 18, 27, 48, 64, 65, 67, 68, 72, 77, 80, 82, 92, 96, 99, 101, 105, 118, 119, 151, 153, 155, 157, 158, 159, 185, 188, 210, 216, and 552. Every licensed NES and Famicom game will boot now.
-* Famicom Disk System (firmware not included) with FCEUmm, press L2+TRIANGLE to change the disk side.
-* Changed SRAM and RAM initialization for both NES and SNES. This will fix all the very few games that rely on specific initial values to work properly.
-* Mega Drive / Genesis + Sega Master System / Mark III + Game Gear + 32X + Sega CD emulation with PicoDrive
-* PC Engine / TurboGrafx-16 HuCard and PC Engine CD emulation with Beetle PCE Fast
-* Fixes and improvements for the 240p display modes, improved screen positioning and overscan settings for each system and graphical resolution/modes.
-* Dedicated turbo buttons for NES, PCE, GG and SMS games
-* Turbo button toggle (hold R2+ANY BUTTON) for SNES and MD games
-* In-game soft reset (L2+SELECT)
-* SNES and MD mouse emulation
-* ASCII Turbo File for Famicom and Super Famicom (accessory for many ASCII games)
-* Battle Box for Famicom (accessory for Armadillo)
-* Arkanoid Pad for Famicom (accessory for Arkanoid and Arkanoid II)
-* Famicom Microphone (L2+START)
-* NES Zapper / Famicom Light Gun (X to shoot, L2+SQUARE to simulate shooting away from the screen)
-* Region selector
-
-User interface:
-
-* Save SRAM to USB
-* Browse SRAM files
-* Confirmation prompt for saving and loading states
-* Faster UI navigation
-* Many options to enable emulation hacks and compatibility modes (exchange accuracy for performance or vice-versa)
-* Option to reload the emulator's .elf (very useful for upgrading and testing new builds)
-
-*(**NOTE**: to find the options above, go to the Video Settings and change the pages with the circle button.)*
-
-Just for fun:
-
-* Famiclone audio option for NES games (swap duty cycles, a known hardware bug in some Famiclones you can intentionally turn on)
-
-
-
-<!-- AURORA_CD_FIRMWARE_V6_20260824 -->
-CD firmware and images **(experimental)**
-
-* Aurora creates `SYSTEM` under the active SNESticle data root, normally `mass0:/SNESticle/SYSTEM` when USB/MX4SIO is available or the configured Memory Card SNESticle directory otherwise.
-* Firmware is **not included**. For PC Engine CD, place `syscard3.pce` in `SYSTEM`. PicoDrive accepts regional Sega CD BIOS names documented in [THIRD_PARTY.md](THIRD_PARTY.md), preferably as `.bin`.
-* Only `.cue` is exposed by this PS2 build. Keep every BIN/audio track referenced by the CUE at the relative location named inside it. CHD is intentionally not exposed because libchdr plus its compression dependencies has not been validated inside the PS2's 32 MiB memory budget.
-
-**FIXED:**
-
-* PC Engine video modes (Ninja Spirits, Aoi Blink, Toumaden, more)
-* Pilotwings (SNES) mode 7 rendering, also fixes other games that rely on it
-* Speedy Gonzales in Los Gatos Banditos (SNES) performance *(with special safe frameskip)*
-* Top Gear (SNES) performance *(with special safe frameskip)*
-* Many other graphical glitches and inaccuracies on many NES, SNES, PCE and SEGA games
-
-**TO BE FIXED:**
-
-* PC Engine CD and Sega CD audio playback performance *(a lot has been improved, though)*
-* SMB (ethernet crossover cable) connection
-* Krazy Creatures (NES) minor graphical glitches
-* Super Mario World 2 (SNES) performance
-* The Lost Vikings 1 and 2 (SNES) black screen
-* Addams Family (SNES) graphical glitches and timing issues
-* Sunset Riders (SNES) graphical glitches
-* Sonic Blast Man (SNES) wrong colors
-* Any other games with performance or graphical issues
-
-**TO BE ADDED:**
-
-* SNES SA-1 Emulation
-* Improve FX1 and FX2 emulation
-* Other stupid (or not-so-stupid) ideas I might come up with. Thanks!
-
-
-## Special thanks
-
-* Pavel (@eXo12): invaluable beta testing, feedbacks and motivation which helped me immensely. Thanks!
-* Aurora: it's a secret to everybody.
+- 本项目基于 **SNESticle Aurora**（Vinícius Nunes，@itsveenee）定制而来；其血统追溯自 **SNESticle Revive**（@ReyFxck）与原版 **SNEsticle**（Icer Addis）。见 [CREDITS.md](CREDITS.md)。
+- **GBA 核心 gpSP**：原作者 Exophase 及 libretro 移植贡献者，GNU GPLv2（`src/third_party/gpsp/COPYING`）。
+- **GB/GBC 核心 Gambatte**：sinamas 及贡献者，GNU GPLv2（`src/third_party/gambatte/COPYING`）。
+- 32MB 游戏的页面置换策略参考了 **ReGBA** 项目的实现思路，特此致谢。
+- 本项目 GPL 覆盖的代码遵循 **GNU GPLv2**（[LICENSE](LICENSE)）；第三方组件遵循各自许可证（[THIRD_PARTY.md](THIRD_PARTY.md)、[LICENSES/](LICENSES) 目录）。
+- **代码许可证 ≠ 品牌授权**：SNEsticle Aurora / Aurora 的名称与品牌由 @itsveenee 保留。本项目以独立的 **anyi** 名称发布，仅为事实性出处标注（"based on SNESticle Aurora"）。见 [BRANDING.md](BRANDING.md)。
+- 说明：本项目大量使用 AI 辅助生成代码，所有改动均已在 PS2 真机上测试验证。
